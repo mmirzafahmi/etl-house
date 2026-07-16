@@ -37,3 +37,6 @@ python-source = "python"
 module-name = "etlhouse._etlhouse"
 manifest-path = "crates/etlhouse-py/Cargo.toml"
 features = ["pyo3/extension-module"]
+# Metadata declares License-File: LICENSE (auto-detected), but maturin's
+# sdist packaging doesn't bundle root-level files unless told to explicitly.
+include = ["LICENSE"]
