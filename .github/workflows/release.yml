@@ -42,12 +42,14 @@ jobs:
           path: dist
 
   macos:
+    # Apple Silicon only for now: Intel (macos-13) runners have been stuck
+    # queued indefinitely on GitHub's shared fleet as it's phased out in favor
+    # of Apple Silicon. Intel Mac users still get the sdist (buildable from
+    # source with Rust installed) until this is revisited.
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - runner: macos-13
-            target: x86_64
           - runner: macos-14
             target: aarch64
     steps:
