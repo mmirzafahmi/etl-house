@@ -476,6 +476,87 @@ def test_column_mapping(mysql_conn, ch_client, mysql_source, ch_target, unique_n
         _drop_ch(ch_client, table)
 
 
+def test_full_refresh_decimal_override_preserves_exact_precision(
+    mysql_conn, ch_client, mysql_source, ch_target, unique_name
+):
+    """MySQL counterpart of the same regression test in test_sync.py:
+    `type_overrides={"col": "Decimal(P,S)"}` now decodes the DECIMAL/
+    NEWDECIMAL value exactly instead of through a lossy Float64 round-trip.
+    Also covers rounding (override scale narrower than the column's own
+    declared scale) and precision overflow on a NOT NULL column (proving
+    it's forced nullable, so the coercion doesn't abort the transfer)."""
+    table = unique_name
+    with mysql_conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+        cur.execute(
+            f"""
+            CREATE TABLE `{table}` (
+                id            BIGINT PRIMARY KEY,
+                amount_wide   DECIMAL(30, 10),
+                amount_round  DECIMAL(10, 4) NOT NULL,
+                amount_narrow DECIMAL(10, 2) NOT NULL
+            )
+            """
+        )
+        cur.executemany(
+            f"INSERT INTO `{table}` (id, amount_wide, amount_round, amount_narrow) "
+            f"VALUES (%s, %s, %s, %s)",
+            [
+                (1, "123456789012345.6789012345", "12.3450", "12.34"),
+                (2, None, "1.0000", "12345.67"),
+            ],
+        )
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            mysql_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+            type_overrides={
+                "amount_wide": "Decimal(30, 10)",
+                "amount_round": "Decimal(10, 2)",
+                "amount_narrow": "Decimal(5, 2)",
+            },
+        )
+        assert result.rows_written == 2
+
+        col_types = {
+            row[0]: row[1]
+            for row in ch_client.query(
+                f"SELECT name, type FROM system.columns "
+                f"WHERE database = currentDatabase() AND table = '{table}'"
+            ).result_rows
+        }
+        assert "Nullable" in col_types["amount_wide"] and "Decimal(30, 10)" in col_types["amount_wide"]
+        assert "Nullable" in col_types["amount_round"] and "Decimal(10, 2)" in col_types["amount_round"]
+        # amount_narrow is NOT NULL in MySQL but must be forced Nullable in
+        # the destination: a Decimal128 value can be coerced to NULL on
+        # overflow (see types::may_coerce_to_null).
+        assert "Nullable" in col_types["amount_narrow"] and "Decimal(5, 2)" in col_types["amount_narrow"]
+
+        rows = {
+            row[0]: (row[1], row[2], row[3])
+            for row in ch_client.query(
+                f"SELECT id, toString(amount_wide), toString(amount_round), toString(amount_narrow) "
+                f"FROM `{table}` ORDER BY id"
+            ).result_rows
+        }
+        assert rows[1] == ("123456789012345.6789012345", "12.35", "12.34")
+        assert rows[2][0] is None, "source NULL stays NULL"
+        # ClickHouse's toString(Decimal) strips trailing zeros (verified live:
+        # toString(toDecimal64('1.0000', 4)) -> "1", not "1.0000") -- the
+        # stored value is still exactly 1.00 at scale 2, this is purely a
+        # display convention, not a precision loss.
+        assert rows[2][1] == "1"
+        assert rows[2][2] is None, "12345.67 overflows Decimal(5,2)'s max of 999.99"
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def _mysql_scalar(mysql_conn, sql: str):
     with mysql_conn.cursor() as cur:
         cur.execute(sql)

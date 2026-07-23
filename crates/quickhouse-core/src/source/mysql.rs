@@ -13,7 +13,7 @@
 
 use mysql_async::consts::{ColumnFlags, ColumnType as MyType};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, SslOpts};
+use mysql_async::{Conn, Opts, OptsBuilder, SslOpts, Value};
 
 use crate::error::{EtlError, Result};
 use crate::types::{mysql::map_mysql_type, ColumnType};
@@ -113,6 +113,10 @@ impl MySqlSource {
                 nullable,
                 arrow,
                 clickhouse_inner: ch_inner,
+                arbitrary_precision_decimal: matches!(
+                    col_type,
+                    MyType::MYSQL_TYPE_DECIMAL | MyType::MYSQL_TYPE_NEWDECIMAL
+                ),
             });
         }
         Ok(cols)
@@ -149,32 +153,31 @@ impl MySqlSource {
             c = quote_my(column),
             t = quote_my_table(table),
         );
-        let row: Option<(Option<i64>, Option<i64>)> = conn
+        // Decode as the raw wire `Value` rather than `i64` directly: a
+        // BIGINT UNSIGNED column can legitimately hold values above
+        // i64::MAX (up to u64::MAX), and MySQL reports those as
+        // `Value::UInt`, not `Value::Int` — decoding straight to `i64` would
+        // fail the whole probe (and abort the entire transfer) instead of
+        // gracefully falling back to a single partition like every other
+        // non-partitionable case below.
+        let row: Option<(Option<Value>, Option<Value>)> = conn
             .query_first(sql)
             .await
             .map_err(|e| EtlError::other(format!("mysql error: {e}")))?;
+        let as_i128 = |v: Value| match v {
+            Value::Int(i) => Some(i as i128),
+            Value::UInt(u) => Some(u as i128),
+            _ => None,
+        };
         let (lo, hi) = match row {
-            Some((Some(lo), Some(hi))) if hi >= lo => (lo, hi),
+            Some((Some(lo), Some(hi))) => match (as_i128(lo), as_i128(hi)) {
+                (Some(lo), Some(hi)) if hi >= lo => (lo, hi),
+                _ => return Ok(single()),
+            },
             _ => return Ok(single()),
         };
 
-        let span = (hi - lo + 1) as u128;
-        let n = n as u128;
-        let step = span.div_ceil(n).max(1);
-
-        let mut parts = Vec::new();
-        let mut start = lo as i128;
-        let mut idx = 0u128;
-        while (start as i64) <= hi {
-            let end = (start + step as i128 - 1).min(hi as i128);
-            let pred = format!("{c} >= {start} AND {c} <= {end}", c = quote_my(column));
-            parts.push(Partition {
-                label: format!("range-{idx}"),
-                predicate: Some(pred),
-            });
-            start = end + 1;
-            idx += 1;
-        }
+        let mut parts = super::range_partitions(lo, hi, n, &quote_my(column));
         if column_nullable {
             parts.push(Partition {
                 label: "null-key".into(),

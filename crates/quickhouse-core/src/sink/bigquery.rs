@@ -500,15 +500,7 @@ impl BigQuerySink {
     /// same job mechanism as `SELECT`).
     pub async fn persist_watermark(&self, cfg: &TransferConfig, watermark: &str, rows: u64) -> Result<()> {
         let source_id = cfg.source_table.clone().or_else(|| cfg.source_query.clone()).unwrap_or_default();
-        let query = format!(
-            "INSERT INTO `{}`.`{}`.`{STATE_TABLE}` (source_table, dest_table, last_watermark, rows, run_ts) \
-             VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP())",
-            self.project_id,
-            self.dataset_id,
-            escape_sql_string(&source_id),
-            escape_sql_string(&cfg.dest_table),
-            escape_sql_string(watermark),
-        );
+        let query = build_persist_watermark_sql(&self.project_id, &self.dataset_id, &source_id, &cfg.dest_table, watermark, rows);
         let job = Job {
             job_reference: JobReference {
                 project_id: self.project_id.clone(),
@@ -631,10 +623,16 @@ fn unique_job_id(prefix: &str, table: &str) -> String {
 }
 
 /// GoogleSQL string literal escaping (used for the hand-built watermark
-/// state queries — matches the escaping already used for BigQuery in
-/// `sync.rs`'s `build_watermark_filter_bigquery`, for consistency).
+/// state queries — matches `sync.rs`'s `escape_bigquery_string`, kept in sync
+/// deliberately). GoogleSQL only recognizes backslash-based escapes — unlike
+/// ANSI SQL's doubled-quote convention (`''`), a doubled single quote is NOT
+/// an escaped quote in BigQuery and is rejected as a syntax error (a
+/// well-documented real-world gotcha porting ANSI-style SQL generation to
+/// BigQuery, e.g. https://github.com/trinodb/trino/issues/7784). Backslash
+/// must be escaped first, or a trailing backslash in a value would escape
+/// the literal's closing quote instead of terminating the string.
 fn escape_sql_string(s: &str) -> String {
-    s.replace('\'', "''")
+    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 /// Build the `TRUNCATE` + `INSERT ... SELECT` transaction that atomically
@@ -656,6 +654,31 @@ fn build_swap_sql(project_id: &str, dataset_id: &str, dest: &str, staging: &str,
          TRUNCATE TABLE {dest_ref}; \
          INSERT INTO {dest_ref} ({col_list}) SELECT {col_list} FROM {staging_ref}; \
          COMMIT TRANSACTION;"
+    )
+}
+
+/// Build the `INSERT` that records a new watermark in `_quickhouse_state` —
+/// see `BigQuerySink::persist_watermark`'s docs. A free function (not a
+/// `&self` method) so it's unit-testable without a real authenticated client,
+/// mirroring `build_swap_sql`/`build_merge_sql`. `` `rows` `` is backtick-quoted
+/// because it's a reserved GoogleSQL keyword (window-framing syntax, e.g.
+/// `ROWS BETWEEN ... PRECEDING`) — every other bare identifier here is a
+/// column name that happens not to collide with a keyword.
+fn build_persist_watermark_sql(
+    project_id: &str,
+    dataset_id: &str,
+    source_id: &str,
+    dest_table: &str,
+    watermark: &str,
+    rows: u64,
+) -> String {
+    format!(
+        "INSERT INTO `{project_id}`.`{dataset_id}`.`{STATE_TABLE}` \
+         (source_table, dest_table, last_watermark, `rows`, run_ts) \
+         VALUES ('{}', '{}', '{}', {rows}, CURRENT_TIMESTAMP())",
+        escape_sql_string(source_id),
+        escape_sql_string(dest_table),
+        escape_sql_string(watermark),
     )
 }
 
@@ -899,6 +922,7 @@ mod tests {
             nullable,
             arrow,
             clickhouse_inner: "irrelevant".into(),
+            arbitrary_precision_decimal: false,
         }
     }
 
@@ -1043,6 +1067,41 @@ mod tests {
         let cols = vec![col("a", DataType::Int64, false), col("b", DataType::Utf8, true)];
         let sql = build_swap_sql("p", "d", "dest", "staging", &cols);
         assert!(sql.contains("(`a`, `b`) SELECT `a`, `b` FROM"), "{sql}");
+    }
+
+    #[test]
+    fn build_persist_watermark_sql_backtick_quotes_the_reserved_rows_column() {
+        // Regression test: `rows` is a reserved GoogleSQL keyword (window-
+        // framing syntax) and must be backtick-quoted as a column identifier,
+        // or every persist_watermark call fails with a syntax error right
+        // after a successful incremental run — 100% reproducible, since it's
+        // independent of write_method, watermark value, or row count.
+        let sql = build_persist_watermark_sql("proj", "ds", "orders", "orders_dest", "2024-06-01", 42);
+        assert!(
+            sql.contains("(source_table, dest_table, last_watermark, `rows`, run_ts)"),
+            "`rows` must be backtick-quoted: {sql}"
+        );
+        assert!(sql.starts_with("INSERT INTO `proj`.`ds`.`_quickhouse_state`"), "{sql}");
+        assert!(sql.contains("VALUES ('orders', 'orders_dest', '2024-06-01', 42, CURRENT_TIMESTAMP())"), "{sql}");
+    }
+
+    #[test]
+    fn build_persist_watermark_sql_escapes_quotes_in_values() {
+        // GoogleSQL doesn't recognize the ANSI doubled-quote escape ('') at
+        // all — only a backslash-escaped quote (\') is valid, so this must
+        // NOT double the quote like the Postgres/ClickHouse/MySQL sinks do.
+        let sql = build_persist_watermark_sql("p", "d", "o'brien", "dest", "it's here", 1);
+        assert!(sql.contains(r"'o\'brien'"), "{sql}");
+        assert!(sql.contains(r"'it\'s here'"), "{sql}");
+    }
+
+    #[test]
+    fn build_persist_watermark_sql_escapes_backslash_before_quote() {
+        // Regression test: a trailing backslash must not swallow the
+        // literal's closing quote (`'ends_with_backslash\'` is an unclosed
+        // string in GoogleSQL) — backslash has to be escaped first.
+        let sql = build_persist_watermark_sql("p", "d", r"a\b", "dest", "wm", 1);
+        assert!(sql.contains(r"'a\\b'"), "{sql}");
     }
 
     #[test]

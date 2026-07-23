@@ -10,14 +10,16 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, Int8Builder, StringBuilder, TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
+    Int16Builder, Int32Builder, Int64Builder, Int8Builder, StringBuilder, TimestampMicrosecondBuilder,
     UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
 };
+use arrow_array::types::{Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use mysql_async::{Row, Value};
 
+use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::{ch_range, ColumnType};
 
@@ -37,6 +39,7 @@ enum ColBuilder {
     Bin(BinaryBuilder),
     Date(Date32Builder),
     Ts(TimestampMicrosecondBuilder),
+    Decimal128(Decimal128Builder, u8, i8),
 }
 
 impl ColBuilder {
@@ -59,6 +62,11 @@ impl ColBuilder {
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new())
             }
+            DataType::Decimal128(p, s) => ColBuilder::Decimal128(
+                Decimal128Builder::new().with_precision_and_scale(*p, *s)?,
+                *p,
+                *s,
+            ),
             other => {
                 // Reachable only if types.rs maps some MySQL column type to an
                 // Arrow type this decoder doesn't implement a builder for.
@@ -86,13 +94,14 @@ impl ColBuilder {
             ColBuilder::Bin(b) => b.append_null(),
             ColBuilder::Date(b) => b.append_null(),
             ColBuilder::Ts(b) => b.append_null(),
+            ColBuilder::Decimal128(b, _, _) => b.append_null(),
         }
     }
 
-    /// Appends `value`, returning `true` if it was an unrepresentable or
-    /// out-of-range MySQL date/datetime that got coerced to NULL instead of
-    /// erroring. Two distinct cases, both common in real legacy tables and both
-    /// fatal to a whole multi-million-row transfer if not handled:
+    /// Appends `value`, returning the [`Coercion`] reason if it was coerced
+    /// to NULL instead of erroring or corrupting the whole transfer. Two
+    /// date/datetime cases, both common in real legacy tables and both fatal
+    /// to a whole multi-million-row transfer if not handled:
     ///   1. The classic `0000-00-00` zero-date (or a partial zero like
     ///      `2024-00-15`) — MySQL allows these by default (no
     ///      `NO_ZERO_DATE`/`NO_ZERO_IN_DATE` sql_mode) and they have no valid
@@ -103,12 +112,15 @@ impl ColBuilder {
     ///      date. ClickHouse's ArrowStream reader rejects these outright with
     ///      `VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`, so they must be filtered here
     ///      rather than at insert time.
-    fn append_value(&mut self, value: Value) -> Result<bool> {
+    ///
+    /// Plus one decimal case: a DECIMAL/NEWDECIMAL value overridden to an
+    /// exact `Decimal(P,S)` that overflows `P`, coerced the same way.
+    fn append_value(&mut self, value: Value) -> Result<Coercion> {
         if matches!(value, Value::NULL) {
             self.append_null();
-            return Ok(false);
+            return Ok(Coercion::None);
         }
-        let mut coerced_to_null = false;
+        let mut coercion = Coercion::None;
         match (self, value) {
             (ColBuilder::Bool(b), Value::Int(i)) => b.append_value(i != 0),
             (ColBuilder::Bool(b), Value::UInt(u)) => b.append_value(u != 0),
@@ -162,6 +174,33 @@ impl ColBuilder {
                 };
                 b.append_value(&s);
             }
+            (ColBuilder::Decimal128(b, p, s), Value::Bytes(v)) => {
+                let text = std::str::from_utf8(&v)
+                    .map_err(|e| EtlError::decode(format!("invalid decimal bytes: {e}")))?;
+                match parse_decimal_text(text)? {
+                    DecimalText::MagnitudeOverflow => {
+                        b.append_null();
+                        coercion = Coercion::DecimalOverflow;
+                    }
+                    DecimalText::Ok { negative, magnitude, scale } => {
+                        match rescale_mantissa(magnitude, scale, *s as i32) {
+                            Some(m) => {
+                                let signed = if negative { -m } else { m };
+                                if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                                    b.append_value(signed);
+                                } else {
+                                    b.append_null();
+                                    coercion = Coercion::DecimalOverflow;
+                                }
+                            }
+                            None => {
+                                b.append_null();
+                                coercion = Coercion::DecimalOverflow;
+                            }
+                        }
+                    }
+                }
+            }
             (ColBuilder::Bin(b), Value::Bytes(v)) => b.append_value(&v),
             // Coerce zero-dates (`0000-00-00`, `2024-00-15`) and dates whose
             // year is outside ClickHouse's representable window to NULL rather
@@ -177,7 +216,7 @@ impl ColBuilder {
                     }
                     _ => {
                         b.append_null();
-                        coerced_to_null = true;
+                        coercion = Coercion::DateRange;
                     }
                 }
             }
@@ -195,7 +234,7 @@ impl ColBuilder {
                     }
                     _ => {
                         b.append_null();
-                        coerced_to_null = true;
+                        coercion = Coercion::DateRange;
                     }
                 }
             }
@@ -209,7 +248,7 @@ impl ColBuilder {
                 )))
             }
         }
-        Ok(coerced_to_null)
+        Ok(coercion)
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -229,6 +268,7 @@ impl ColBuilder {
             ColBuilder::Bin(b) => Arc::new(b.finish()),
             ColBuilder::Date(b) => Arc::new(b.finish()),
             ColBuilder::Ts(b) => Arc::new(b.finish()),
+            ColBuilder::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
     }
 }
@@ -257,6 +297,10 @@ pub struct MySqlBatcher {
     /// Count of unrepresentable MySQL dates/datetimes (e.g. `0000-00-00`)
     /// coerced to NULL across the whole stream — see `ColBuilder::append_value`.
     pub invalid_dates_total: u64,
+    /// Count of DECIMAL/NEWDECIMAL values coerced to NULL because they
+    /// overflowed a `Decimal(P,S)` override's precision (see
+    /// `ColBuilder::append_value`'s `Decimal128` arm).
+    pub invalid_decimals_total: u64,
 }
 
 impl MySqlBatcher {
@@ -282,6 +326,7 @@ impl MySqlBatcher {
             bytes_in_batch: 0,
             rows_total: 0,
             invalid_dates_total: 0,
+            invalid_decimals_total: 0,
         })
     }
 
@@ -304,11 +349,13 @@ impl MySqlBatcher {
         for (i, builder) in self.builders.iter_mut().enumerate() {
             let value = row.as_ref(i).cloned().unwrap_or(Value::NULL);
             row_bytes += value_size(&value);
-            let coerced = builder
+            let coercion = builder
                 .append_value(value)
                 .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
-            if coerced {
-                self.invalid_dates_total += 1;
+            match coercion {
+                Coercion::None => {}
+                Coercion::DateRange => self.invalid_dates_total += 1,
+                Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
             }
         }
         self.rows_in_batch += 1;
@@ -349,11 +396,11 @@ mod tests {
     fn time_formatted_as_signed_text() {
         // TIME maps to a String column: (is_neg, days, hours, minutes, seconds, micros).
         let mut b = ColBuilder::new(&DataType::Utf8).unwrap();
-        assert!(!b.append_value(Value::Time(false, 0, 10, 30, 0, 0)).unwrap()); // 10:30:00
-        assert!(!b.append_value(Value::Time(true, 0, 5, 0, 0, 0)).unwrap()); // -05:00:00
-        assert!(!b.append_value(Value::Time(false, 34, 22, 59, 59, 0)).unwrap()); // 838:59:59
-        assert!(!b.append_value(Value::Time(false, 0, 1, 2, 3, 500_000)).unwrap()); // sub-second
-        assert!(!b.append_value(Value::NULL).unwrap());
+        assert_eq!(b.append_value(Value::Time(false, 0, 10, 30, 0, 0)).unwrap(), Coercion::None); // 10:30:00
+        assert_eq!(b.append_value(Value::Time(true, 0, 5, 0, 0, 0)).unwrap(), Coercion::None); // -05:00:00
+        assert_eq!(b.append_value(Value::Time(false, 34, 22, 59, 59, 0)).unwrap(), Coercion::None); // 838:59:59
+        assert_eq!(b.append_value(Value::Time(false, 0, 1, 2, 3, 500_000)).unwrap(), Coercion::None); // sub-second
+        assert_eq!(b.append_value(Value::NULL).unwrap(), Coercion::None);
 
         let arr = b.finish();
         let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
@@ -368,12 +415,12 @@ mod tests {
     fn date_builder_coerces_zero_and_out_of_range_to_null() {
         let mut b = ColBuilder::new(&DataType::Date32).unwrap();
         // (year, month, day, hour, min, sec, micros)
-        assert!(!b.append_value(Value::Date(2024, 5, 1, 0, 0, 0, 0)).unwrap()); // in range
-        assert!(b.append_value(Value::Date(0, 0, 0, 0, 0, 0, 0)).unwrap()); // zero-date
-        assert!(b.append_value(Value::Date(2024, 0, 15, 0, 0, 0, 0)).unwrap()); // partial-zero
-        assert!(b.append_value(Value::Date(9999, 12, 31, 0, 0, 0, 0)).unwrap()); // far future
-        assert!(b.append_value(Value::Date(1800, 6, 15, 0, 0, 0, 0)).unwrap()); // pre-1900
-        assert!(!b.append_value(Value::NULL).unwrap()); // NULL is not a coercion
+        assert_eq!(b.append_value(Value::Date(2024, 5, 1, 0, 0, 0, 0)).unwrap(), Coercion::None); // in range
+        assert_eq!(b.append_value(Value::Date(0, 0, 0, 0, 0, 0, 0)).unwrap(), Coercion::DateRange); // zero-date
+        assert_eq!(b.append_value(Value::Date(2024, 0, 15, 0, 0, 0, 0)).unwrap(), Coercion::DateRange); // partial-zero
+        assert_eq!(b.append_value(Value::Date(9999, 12, 31, 0, 0, 0, 0)).unwrap(), Coercion::DateRange); // far future
+        assert_eq!(b.append_value(Value::Date(1800, 6, 15, 0, 0, 0, 0)).unwrap(), Coercion::DateRange); // pre-1900
+        assert_eq!(b.append_value(Value::NULL).unwrap(), Coercion::None); // NULL is not a coercion
 
         let arr = b.finish();
         let arr = arr.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -388,14 +435,67 @@ mod tests {
     #[test]
     fn ts_builder_coerces_out_of_range_datetimes_to_null() {
         let mut b = ColBuilder::new(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap();
-        assert!(!b.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap()); // in range
-        assert!(b.append_value(Value::Date(9999, 12, 31, 23, 59, 59, 0)).unwrap()); // far future
-        assert!(b.append_value(Value::Date(1899, 12, 31, 0, 0, 0, 0)).unwrap()); // pre-1900
+        assert_eq!(b.append_value(Value::Date(2024, 5, 1, 10, 0, 0, 0)).unwrap(), Coercion::None); // in range
+        assert_eq!(b.append_value(Value::Date(9999, 12, 31, 23, 59, 59, 0)).unwrap(), Coercion::DateRange); // far future
+        assert_eq!(b.append_value(Value::Date(1899, 12, 31, 0, 0, 0, 0)).unwrap(), Coercion::DateRange); // pre-1900
 
         let arr = b.finish();
         let arr = arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
         assert!(!arr.is_null(0));
         assert!(arr.is_null(1));
         assert!(arr.is_null(2));
+    }
+
+    #[test]
+    fn decimal_decodes_exact_text_value() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
+        let coercion = b.append_value(Value::Bytes(b"123.4500".to_vec())).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 1_234_500);
+    }
+
+    #[test]
+    fn decimal_rounds_half_away_from_zero_when_narrowing() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        // 12.345 narrowed to scale 2: 1234 remainder 5, divisor 10 -> rounds
+        // up to 1235 (12.35), not truncated to 1234 (12.34).
+        let coercion = b.append_value(Value::Bytes(b"12.345".to_vec())).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 1235);
+    }
+
+    #[test]
+    fn decimal_negative_value_round_trips_exactly() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        let coercion = b.append_value(Value::Bytes(b"-42.5".to_vec())).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), -4250);
+    }
+
+    #[test]
+    fn decimal_coerces_to_null_when_value_overflows_declared_precision() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(3, 0)).unwrap();
+        let coercion = b.append_value(Value::Bytes(b"1234".to_vec())).unwrap();
+        assert_eq!(coercion, Coercion::DecimalOverflow);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn decimal_zero_scale_text_has_no_decimal_point() {
+        // MySQL's DECIMAL(n, 0) text has no trailing '.' at all.
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 0)).unwrap();
+        let coercion = b.append_value(Value::Bytes(b"42".to_vec())).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 42);
     }
 }

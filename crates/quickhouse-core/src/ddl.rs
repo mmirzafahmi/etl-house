@@ -4,9 +4,14 @@ use crate::config::{SyncMode, TransferConfig};
 use crate::error::{EtlError, Result};
 use crate::types::ColumnType;
 
-/// Quote/escape a ClickHouse identifier with backticks.
+/// Quote/escape a ClickHouse identifier with backticks. Backslash is escaped
+/// *before* the backtick — a name ending in a backslash (e.g. from
+/// `rename={"col": "name\\"}`, unvalidated on the way in) would otherwise
+/// escape the closing backtick instead of terminating the identifier
+/// (independently verified against a real ClickHouse server: `` CREATE TABLE
+/// `bad\` (...) `` fails with "Code: 62. Back quoted string is not closed").
 pub fn quote_ident(name: &str) -> String {
-    format!("`{}`", name.replace('`', "\\`"))
+    format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 /// Fully-qualified `db`.`table`.
@@ -119,6 +124,7 @@ mod tests {
             nullable,
             arrow: DataType::Int32,
             clickhouse_inner: ch.into(),
+            arbitrary_precision_decimal: false,
         }
     }
 
@@ -162,5 +168,15 @@ mod tests {
         let cols = vec![col("id", "Int32", false)];
         let sql = create_table("analytics", "t", &cols, &base_cfg(SyncMode::Incremental)).unwrap();
         assert!(sql.contains("ReplacingMergeTree(`write_date`)"));
+    }
+
+    #[test]
+    fn quote_ident_escapes_backslash_before_backtick() {
+        // Regression test: a name ending in a backslash used to escape the
+        // closing backtick instead of terminating the identifier (verified
+        // against a real ClickHouse server: `` CREATE TABLE `bad\` (...) ``
+        // fails with "Code: 62. Back quoted string is not closed").
+        assert_eq!(quote_ident(r"bad\"), r"`bad\\`");
+        assert_eq!(quote_ident("has`tick"), r"`has\`tick`");
     }
 }

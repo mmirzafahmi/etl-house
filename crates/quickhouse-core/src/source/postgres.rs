@@ -139,6 +139,7 @@ impl PgSource {
                 nullable,
                 arrow,
                 clickhouse_inner: ch_inner,
+                arbitrary_precision_decimal: pg_oid == oid::NUMERIC,
             });
         }
         Ok(cols)
@@ -207,26 +208,7 @@ impl PgSource {
             _ => return Ok(single()),
         };
 
-        let span = (hi - lo + 1) as u128;
-        let n = n as u128;
-        let step = span.div_ceil(n).max(1);
-
-        let mut parts = Vec::new();
-        let mut start = lo as i128;
-        let mut idx = 0u128;
-        while (start as i64) <= hi {
-            let end = (start + step as i128 - 1).min(hi as i128);
-            let pred = format!(
-                "{c} >= {start} AND {c} <= {end}",
-                c = quote_pg(column),
-            );
-            parts.push(Partition {
-                label: format!("range-{idx}"),
-                predicate: Some(pred),
-            });
-            start = end + 1;
-            idx += 1;
-        }
+        let mut parts = super::range_partitions(lo as i128, hi as i128, n, &quote_pg(column));
         // Rows whose partition key is NULL would be skipped by range predicates.
         if column_nullable {
             parts.push(Partition {
@@ -325,17 +307,17 @@ fn split_qualified(table: &str) -> (Option<String>, String) {
     }
 }
 
-fn unquote(s: &str) -> String {
+pub(crate) fn unquote(s: &str) -> String {
     s.trim().trim_matches('"').to_string()
 }
 
 /// Double-quote a PostgreSQL identifier.
-fn quote_pg(name: &str) -> String {
+pub(crate) fn quote_pg(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Quote a possibly schema-qualified table name.
-fn quote_pg_table(table: &str) -> String {
+pub(crate) fn quote_pg_table(table: &str) -> String {
     match table.split_once('.') {
         Some((s, t)) => format!("{}.{}", quote_pg(&unquote(s)), quote_pg(&unquote(t))),
         None => quote_pg(&unquote(table)),
@@ -427,5 +409,20 @@ OCm3XK2CW4/x+Z55ntrAffyyonL3V3vHIz7fokiz5H+l
     fn qualified_split() {
         assert_eq!(split_qualified("public.t"), (Some("public".into()), "t".into()));
         assert_eq!(split_qualified("t"), (None, "t".into()));
+    }
+
+    #[test]
+    fn quote_pg_table_doubles_embedded_double_quotes() {
+        // Regression test: sync.rs's own schema-probe query used to quote
+        // table names with a simpler, subtly different helper that trimmed
+        // but never doubled an embedded `"` — inconsistent with this
+        // function (used for the actual bulk COPY read), which correctly
+        // doubles it. sync.rs now reuses this function directly instead of
+        // maintaining a second, divergent implementation.
+        assert_eq!(quote_pg_table("weird\"table"), "\"weird\"\"table\"");
+        assert_eq!(
+            quote_pg_table("public.weird\"table"),
+            "\"public\".\"weird\"\"table\""
+        );
     }
 }

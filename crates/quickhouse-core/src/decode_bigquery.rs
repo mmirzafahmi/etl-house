@@ -10,13 +10,15 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampMicrosecondBuilder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float64Builder, Int64Builder,
+    StringBuilder, TimestampMicrosecondBuilder,
 };
+use arrow_array::types::{Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use google_cloud_bigquery::storage::row::Row;
 
+use crate::decimal::{parse_decimal_text, rescale_mantissa, Coercion, DecimalText};
 use crate::error::{EtlError, Result};
 use crate::types::bigquery::type_id as id;
 use crate::types::{ch_range, ColumnType};
@@ -37,7 +39,8 @@ enum ColBuilder {
     Str(StringBuilder),
     Bin(BinaryBuilder),
     Date(Date32Builder),
-    Ts(TimestampMicrosecondBuilder),
+    Ts(TimestampMicrosecondBuilder, Option<Arc<str>>),
+    Decimal128(Decimal128Builder, u8, i8),
 }
 
 impl ColBuilder {
@@ -49,9 +52,14 @@ impl ColBuilder {
             DataType::Utf8 => ColBuilder::Str(StringBuilder::new()),
             DataType::Binary => ColBuilder::Bin(BinaryBuilder::new()),
             DataType::Date32 => ColBuilder::Date(Date32Builder::new()),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                ColBuilder::Ts(TimestampMicrosecondBuilder::new())
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                ColBuilder::Ts(TimestampMicrosecondBuilder::new(), tz.clone())
             }
+            DataType::Decimal128(p, s) => ColBuilder::Decimal128(
+                Decimal128Builder::new().with_precision_and_scale(*p, *s)?,
+                *p,
+                *s,
+            ),
             other => {
                 // Reachable only if types.rs maps some BigQuery field type to
                 // an Arrow type this decoder doesn't implement a builder for.
@@ -62,14 +70,17 @@ impl ColBuilder {
         })
     }
 
-    /// Appends the value and returns `(approx_size_bytes, coerced_to_null)`.
-    /// The size is used only to decide when to flush a batch (not exact memory
-    /// accounting); `coerced_to_null` is `true` for a valid date/datetime whose
-    /// year is outside ClickHouse's representable window ([`ch_range`]) and was
-    /// nulled rather than sent on to be rejected at insert time. BigQuery's DATE
-    /// range (0001..=9999) is far wider than ClickHouse's, so this is reachable.
-    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<(usize, bool)> {
-        let mut coerced_to_null = false;
+    /// Appends the value and returns `(approx_size_bytes, coercion)`. The
+    /// size is used only to decide when to flush a batch (not exact memory
+    /// accounting); [`Coercion::DateRange`] is returned for a valid
+    /// date/datetime whose year is outside ClickHouse's representable window
+    /// ([`ch_range`]) and was nulled rather than sent on to be rejected at
+    /// insert time — BigQuery's DATE range (0001..=9999) is far wider than
+    /// ClickHouse's, so this is reachable. [`Coercion::DecimalOverflow`] is
+    /// returned for a NUMERIC/BIGNUMERIC value overridden to an exact
+    /// `Decimal(P,S)` that doesn't fit `P`.
+    fn append_from_row(&mut self, row: &Row, index: usize, type_id: u32) -> Result<(usize, Coercion)> {
+        let mut coercion = Coercion::None;
         let size = match (&mut *self, type_id) {
             (ColBuilder::Bool(b), t) if t == id::BOOLEAN => {
                 match row.column::<Option<bool>>(index).map_err(conv_err)? {
@@ -102,6 +113,44 @@ impl ColBuilder {
                             .map_err(|e| EtlError::decode(format!("invalid BigQuery numeric '{s}': {e}")))?;
                         b.append_value(v);
                         s.len()
+                    }
+                    None => {
+                        b.append_null();
+                        0
+                    }
+                }
+            }
+            // Same NUMERIC/BIGNUMERIC decimal-text source as above, but for a
+            // column overridden to an exact `Decimal(P,S)` — parsed into a
+            // scaled i128 instead of going through the lossy f64 arm above.
+            (ColBuilder::Decimal128(b, p, s), t) if t == id::NUMERIC || t == id::BIGNUMERIC => {
+                match row.column::<Option<String>>(index).map_err(conv_err)? {
+                    Some(text) => {
+                        let n = text.len();
+                        match parse_decimal_text(&text)? {
+                            DecimalText::MagnitudeOverflow => {
+                                b.append_null();
+                                coercion = Coercion::DecimalOverflow;
+                            }
+                            DecimalText::Ok { negative, magnitude, scale } => {
+                                match rescale_mantissa(magnitude, scale, *s as i32) {
+                                    Some(m) => {
+                                        let signed = if negative { -m } else { m };
+                                        if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                                            b.append_value(signed);
+                                        } else {
+                                            b.append_null();
+                                            coercion = Coercion::DecimalOverflow;
+                                        }
+                                    }
+                                    None => {
+                                        b.append_null();
+                                        coercion = Coercion::DecimalOverflow;
+                                    }
+                                }
+                            }
+                        }
+                        n
                     }
                     None => {
                         b.append_null();
@@ -143,20 +192,20 @@ impl ColBuilder {
                     }
                     Some(_) => {
                         b.append_null();
-                        coerced_to_null = true;
+                        coercion = Coercion::DateRange;
                     }
                     None => b.append_null(),
                 }
                 4
             }
-            (ColBuilder::Ts(b), t) if t == id::TIMESTAMP || t == id::DATETIME => {
+            (ColBuilder::Ts(b, _), t) if t == id::TIMESTAMP || t == id::DATETIME => {
                 match row.column::<Option<time::OffsetDateTime>>(index).map_err(conv_err)? {
                     Some(dt) if ch_range::year_in_range(dt.year()) => {
                         b.append_value((dt.unix_timestamp_nanos() / 1000) as i64)
                     }
                     Some(_) => {
                         b.append_null();
-                        coerced_to_null = true;
+                        coercion = Coercion::DateRange;
                     }
                     None => b.append_null(),
                 }
@@ -197,7 +246,7 @@ impl ColBuilder {
                 )))
             }
         };
-        Ok((size, coerced_to_null))
+        Ok((size, coercion))
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -208,7 +257,14 @@ impl ColBuilder {
             ColBuilder::Str(b) => Arc::new(b.finish()),
             ColBuilder::Bin(b) => Arc::new(b.finish()),
             ColBuilder::Date(b) => Arc::new(b.finish()),
-            ColBuilder::Ts(b) => Arc::new(b.finish()),
+            ColBuilder::Ts(b, tz) => {
+                let arr = b.finish();
+                match tz {
+                    Some(tz) => Arc::new(arr.with_timezone(tz.clone())),
+                    None => Arc::new(arr),
+                }
+            }
+            ColBuilder::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
     }
 }
@@ -225,6 +281,10 @@ pub struct BigQueryBatcher {
     /// Count of valid dates/datetimes whose year fell outside ClickHouse's
     /// representable window and were coerced to NULL (see `append_from_row`).
     pub invalid_dates_total: u64,
+    /// Count of NUMERIC/BIGNUMERIC values coerced to NULL because they
+    /// overflowed a `Decimal(P,S)` override's precision (see
+    /// `append_from_row`'s `Decimal128` arm).
+    pub invalid_decimals_total: u64,
 }
 
 impl BigQueryBatcher {
@@ -251,6 +311,7 @@ impl BigQueryBatcher {
             bytes_in_batch: 0,
             rows_total: 0,
             invalid_dates_total: 0,
+            invalid_decimals_total: 0,
         })
     }
 
@@ -262,12 +323,14 @@ impl BigQueryBatcher {
     pub fn append_row(&mut self, row: &Row) -> Result<Option<RecordBatch>> {
         let mut row_bytes = 0usize;
         for (i, builder) in self.builders.iter_mut().enumerate() {
-            let (size, coerced) = builder
+            let (size, coercion) = builder
                 .append_from_row(row, i, self.type_ids[i])
                 .map_err(|e| e.context(format!("column '{}'", self.schema.field(i).name())))?;
             row_bytes += size;
-            if coerced {
-                self.invalid_dates_total += 1;
+            match coercion {
+                Coercion::None => {}
+                Coercion::DateRange => self.invalid_dates_total += 1,
+                Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
             }
         }
         self.rows_in_batch += 1;
@@ -296,5 +359,73 @@ impl BigQueryBatcher {
         self.rows_in_batch = 0;
         self.bytes_in_batch = 0;
         RecordBatch::try_new(self.schema.clone(), cols).map_err(EtlError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, StringArray};
+    use google_cloud_bigquery::storage::value::StructDecodable;
+
+    /// Build a single-column `Row` wrapping a BigQuery NUMERIC/BIGNUMERIC's
+    /// decimal-text representation — `Row`'s only public construction path
+    /// is via its `StructDecodable` impl (Arrow arrays under the hood, per
+    /// this file's own module docs), so a real column array round-trips
+    /// through the exact same `row.column::<Option<String>>()` call
+    /// `append_from_row` itself uses, with no live BigQuery connection needed.
+    fn numeric_row(value: Option<&str>) -> Row {
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![value]));
+        Row::decode_arrow(&[arr], 0).unwrap()
+    }
+
+    #[test]
+    fn decimal_decodes_exact_text_value() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
+        let (_, coercion) = b.append_from_row(&numeric_row(Some("123.4500")), 0, id::NUMERIC).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 1_234_500);
+    }
+
+    #[test]
+    fn decimal_rounds_half_away_from_zero_when_narrowing() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        let (_, coercion) = b.append_from_row(&numeric_row(Some("12.345")), 0, id::BIGNUMERIC).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 1235); // 12.345 -> 12.35, not truncated to 12.34
+    }
+
+    #[test]
+    fn decimal_negative_value_round_trips_exactly() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        let (_, coercion) = b.append_from_row(&numeric_row(Some("-42.5")), 0, id::NUMERIC).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), -4250);
+    }
+
+    #[test]
+    fn decimal_coerces_to_null_when_value_overflows_declared_precision() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(3, 0)).unwrap();
+        let (_, coercion) = b.append_from_row(&numeric_row(Some("1234")), 0, id::NUMERIC).unwrap();
+        assert_eq!(coercion, Coercion::DecimalOverflow);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn decimal_null_value_stays_null_with_no_coercion() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        let (_, coercion) = b.append_from_row(&numeric_row(None), 0, id::NUMERIC).unwrap();
+        assert_eq!(coercion, Coercion::None);
+        let arr = b.finish();
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert!(arr.is_null(0));
     }
 }

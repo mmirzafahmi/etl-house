@@ -26,7 +26,7 @@ use google_cloud_bigquery::http::table::{TableFieldMode, TableReference, TableSc
 use google_cloud_googleapis::cloud::bigquery::storage::v1::read_session::TableReadOptions;
 
 use crate::error::{EtlError, Result};
-use crate::types::bigquery::map_type;
+use crate::types::bigquery::{map_type, type_id as id};
 use crate::types::ColumnType;
 
 pub struct BigQuerySource {
@@ -249,6 +249,7 @@ fn columns_from_schema(schema: &TableSchema) -> Result<Vec<ColumnType>> {
             nullable,
             arrow,
             clickhouse_inner: ch_inner,
+            arbitrary_precision_decimal: matches!(type_id, id::NUMERIC | id::BIGNUMERIC),
         });
     }
     Ok(cols)

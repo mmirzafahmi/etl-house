@@ -2,17 +2,27 @@
 //! describing which source columns to read and how the *destination* columns
 //! are named and typed.
 //!
-//! Renames only relabel Arrow fields (data is identical). Type overrides change
-//! the ClickHouse DDL type; ClickHouse converts the incoming Arrow physical type
-//! to the destination column type at insert time (e.g. `String` -> `UUID`,
-//! `Float64` -> `Decimal(...)`), which is why the Arrow type is left untouched.
+//! Renames only relabel Arrow fields (data is identical). Type overrides
+//! usually only change the ClickHouse DDL type; ClickHouse converts the
+//! incoming Arrow physical type to the destination column type at insert
+//! time (e.g. `String` -> `UUID`), which is why the Arrow type is otherwise
+//! left untouched. The one exception: an arbitrary-precision NUMERIC/DECIMAL
+//! source column overridden to `"Decimal(P, S)"` (`P <= 38`) also gets its
+//! Arrow type promoted to `Decimal128(P, S)` here, so the decoder can decode
+//! it exactly instead of through a lossy `Float64` round-trip — see
+//! `decimal.rs`.
 
 use std::collections::HashSet;
 
+use arrow_array::types::{validate_decimal_precision_and_scale, Decimal128Type};
+use arrow_schema::DataType;
+
 use crate::config::TransferConfig;
+use crate::decimal::parse_decimal_override;
 use crate::error::{EtlError, Result};
 use crate::types::{may_coerce_to_null, ColumnType};
 
+#[derive(Debug)]
 pub struct SelectPlan {
     /// Source column names to read, in order (drives the COPY SELECT list).
     pub source_columns: Vec<String>,
@@ -94,17 +104,50 @@ pub fn plan(source: &[ColumnType], cfg: &TransferConfig) -> Result<SelectPlan> {
         // constraints, not something papered over here (both combinations
         // are expected to be rare: a business/dedup key or watermark column
         // with legacy zero-date values).
+        // An arbitrary-precision decimal column overridden to "Decimal(P,
+        // S)" gets its Arrow type promoted from Float64 to Decimal128(P,S)
+        // so the decoder can decode it exactly (see decimal.rs). Gating on
+        // the already-resolved `ch_inner` (rather than re-querying
+        // `cfg.type_overrides`) means one code path whether or not this
+        // column was overridden: with no override, `ch_inner` is just
+        // `c.clickhouse_inner` ("Float64"), which never parses as
+        // "Decimal(P,S)", so `arrow` falls through unchanged below.
+        //
+        // Safe even though `plan()` has no destination-type knowledge (the
+        // same `type_overrides` map is reused verbatim for a BigQuery
+        // destination's own type-name syntax, e.g. "NUMERIC" — see
+        // sink/bigquery.rs::build_table): a BigQuery type name never
+        // contains parens or digits, so it can never parse as
+        // "Decimal(P,S)" and this branch is simply never taken for that case.
+        let arrow = if c.arbitrary_precision_decimal {
+            match parse_decimal_override(&ch_inner) {
+                Some((p, s)) => {
+                    validate_decimal_precision_and_scale::<Decimal128Type>(p, s).map_err(|e| {
+                        EtlError::config(format!(
+                            "column '{dest_name}': type_overrides '{ch_inner}' is not a valid \
+                             Decimal128(P,S) override: {e} (Decimal256/P>38 isn't supported yet — \
+                             use P<=38, or drop the override to keep the default lossy Float64 mapping)"
+                        ))
+                    })?;
+                    DataType::Decimal128(p, s)
+                }
+                None => c.arrow.clone(),
+            }
+        } else {
+            c.arrow.clone()
+        };
         let nullable = if force_non_nullable {
             false
         } else {
-            c.nullable || may_coerce_to_null(&c.arrow)
+            c.nullable || may_coerce_to_null(&arrow)
         };
         dest_columns.push(ColumnType {
             name: dest_name,
             type_id: c.type_id,
             nullable,
-            arrow: c.arrow.clone(),
+            arrow,
             clickhouse_inner: ch_inner,
+            arbitrary_precision_decimal: c.arbitrary_precision_decimal,
         });
     }
 
@@ -127,6 +170,7 @@ mod tests {
             nullable: true,
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),
+            arbitrary_precision_decimal: false,
         }
     }
 
@@ -137,6 +181,22 @@ mod tests {
             nullable,
             arrow,
             clickhouse_inner: "irrelevant".into(),
+            arbitrary_precision_decimal: false,
+        }
+    }
+
+    /// A source column shaped like a real Postgres/MySQL/BigQuery
+    /// arbitrary-precision NUMERIC/DECIMAL column: defaults to Float64 with
+    /// `arbitrary_precision_decimal: true`, same as any of the three
+    /// sources' own schema resolution would produce.
+    fn decimal_col(name: &str) -> ColumnType {
+        ColumnType {
+            name: name.into(),
+            type_id: 0,
+            nullable: true,
+            arrow: DataType::Float64,
+            clickhouse_inner: "Float64".into(),
+            arbitrary_precision_decimal: true,
         }
     }
 
@@ -310,5 +370,61 @@ mod tests {
         let p = plan(&src, &cfg).unwrap();
         assert_eq!(p.dest_columns[0].name, "pk");
         assert!(!p.dest_columns[0].nullable);
+    }
+
+    /// Bug #6 fix: a `type_overrides` "Decimal(P, S)" entry on an
+    /// arbitrary-precision decimal column must promote the Arrow type from
+    /// Float64 to Decimal128(P, S), so the decoder can decode it exactly
+    /// instead of through the previously-lossy Float64 round-trip.
+    #[test]
+    fn decimal_override_promotes_arrow_type_to_decimal128() {
+        let src = vec![decimal_col("amount")];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("amount".to_string(), "Decimal(30, 10)".to_string())]);
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Decimal128(30, 10));
+        // A Decimal128 column may be coerced to NULL on overflow, so it must
+        // be forced nullable regardless of the source's own nullability.
+        assert!(p.dest_columns[0].nullable);
+    }
+
+    /// Without an override, an arbitrary-precision decimal column keeps its
+    /// default Float64 mapping unchanged (today's existing, lossy behavior —
+    /// unaffected by this fix, which only activates when the user opts in).
+    #[test]
+    fn decimal_column_stays_float64_without_override() {
+        let src = vec![decimal_col("amount")];
+        let p = plan(&src, &cfg()).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+    }
+
+    /// Regression guard: a genuine Float64 column (arbitrary_precision_decimal:
+    /// false) must NEVER be reinterpreted as Decimal128, even if its
+    /// type_overrides string happens to parse as "Decimal(P,S)" syntax.
+    #[test]
+    fn genuine_float_column_is_never_reinterpreted_as_decimal() {
+        let src = vec![typed_col("ratio", DataType::Float64, true)];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("ratio".to_string(), "Decimal(10, 2)".to_string())]);
+        let p = plan(&src, &cfg).unwrap();
+        assert_eq!(p.dest_columns[0].arrow, DataType::Float64);
+        // The DDL override string itself is still honored (it just doesn't
+        // change the Arrow decode path for a non-decimal-sourced column).
+        assert_eq!(p.dest_columns[0].clickhouse_inner, "Decimal(10, 2)");
+    }
+
+    /// A `Decimal(P, S)` override with `P > 38` is a hard config error at
+    /// plan() time — not a silent fallback to the lossy Float64 mapping,
+    /// which would defeat the fix for exactly the inputs it exists to
+    /// protect while the user believes precision is now handled. Decimal256
+    /// (P 39-76) is a documented, not-yet-implemented follow-up.
+    #[test]
+    fn decimal_override_precision_above_38_is_a_config_error() {
+        let src = vec![decimal_col("amount")];
+        let mut cfg = cfg();
+        cfg.type_overrides = HashMap::from([("amount".to_string(), "Decimal(50, 10)".to_string())]);
+        let err = plan(&src, &cfg).unwrap_err().to_string();
+        assert!(err.contains("amount"), "must name the column: {err}");
+        assert!(err.contains("Decimal256"), "must mention the Decimal256 follow-up: {err}");
     }
 }

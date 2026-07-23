@@ -9,8 +9,7 @@ use arrow_schema::DataType;
 
 /// ClickHouse's `Date32`/`DateTime64` representable window, `[1900-01-01,
 /// 2299-12-31]`. Any date/datetime outside this is rejected by ClickHouse's
-/// ArrowStream reader with `Code: 321 VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`
-/// (confirmed against ClickHouse 24.8: `Date32` accepts days `[-25567, 120530]`),
+/// ArrowStream reader with `Code: 321 VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE`,
 /// which aborts the whole transfer. Source engines allow far wider ranges
 /// (MySQL DATE `1000..=9999`, Postgres/BigQuery wider still), so every source's
 /// decoder coerces out-of-range values to NULL before they reach the insert.
@@ -22,8 +21,11 @@ pub mod ch_range {
     pub const MIN_YEAR: i32 = 1900;
     pub const MAX_YEAR: i32 = 2299;
     /// Days from the Unix epoch to 1900-01-01 / 2299-12-31 (the Date32 bounds).
+    /// 2299-12-31 is epoch day 120_529, not 120_530 (that's 2300-01-01) — a
+    /// one-line fencepost error here previously let a Postgres date/timestamp
+    /// of exactly 2300-01-01 slip through the NULL-coercion guard unmodified.
     pub const MIN_DAYS: i32 = -25_567;
-    pub const MAX_DAYS: i32 = 120_530;
+    pub const MAX_DAYS: i32 = 120_529;
     /// Microseconds from the Unix epoch to the first instant of 1900-01-01 and
     /// the last microsecond of 2299-12-31 (the DateTime64 bounds).
     pub const MIN_MICROS: i64 = MIN_DAYS as i64 * 86_400 * 1_000_000;
@@ -41,8 +43,11 @@ pub mod ch_range {
 }
 
 /// Whether `arrow` is a type whose decoders may coerce an otherwise-valid
-/// value to NULL — currently `Date32`/`Timestamp` only (zero-dates and
-/// out-of-`ch_range` years; see each decoder's `ColBuilder::append_value`).
+/// value to NULL — `Date32`/`Timestamp` (zero-dates and out-of-`ch_range`
+/// years; see each decoder's `ColBuilder::append_value`), and `Decimal128`
+/// (a value that overflows the declared `Decimal(P,S)` precision, or is
+/// NaN/Infinity on the Postgres path; see `decimal.rs` and each decoder's
+/// decimal handling).
 ///
 /// A destination column of one of these types must be resolved as nullable
 /// regardless of the source's own `NOT NULL` constraint. Without this, a
@@ -56,7 +61,7 @@ pub mod ch_range {
 /// of truth: `transform::plan` feeds both the Arrow schema construction (via
 /// each decoder's `Field::new(.., nullable)`) and the destination DDL.
 pub fn may_coerce_to_null(arrow: &DataType) -> bool {
-    matches!(arrow, DataType::Date32 | DataType::Timestamp(_, _))
+    matches!(arrow, DataType::Date32 | DataType::Timestamp(_, _) | DataType::Decimal128(_, _))
 }
 
 /// Well-known PostgreSQL `pg_type.oid` values we decode natively.
@@ -95,6 +100,16 @@ pub struct ColumnType {
     pub arrow: DataType,
     /// ClickHouse type *without* the `Nullable(...)` wrapper.
     pub clickhouse_inner: String,
+    /// True only for a source column whose declared type is
+    /// arbitrary-precision (Postgres `numeric`, MySQL
+    /// DECIMAL/NEWDECIMAL, BigQuery NUMERIC/BIGNUMERIC) — never for a
+    /// genuine FLOAT/DOUBLE column, which must not be reinterpreted as
+    /// `Decimal128` by a `type_overrides` entry even though both currently
+    /// default to Arrow `Float64`. Set once by each source's own
+    /// `resolve_columns`/`columns_from_schema`; consumed only by
+    /// `transform::plan` (decoders don't need it directly — see
+    /// `decimal.rs`'s module docs).
+    pub arbitrary_precision_decimal: bool,
 }
 
 impl ColumnType {
@@ -345,17 +360,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn may_coerce_to_null_covers_date_and_timestamp_only() {
+    fn may_coerce_to_null_covers_date_timestamp_and_decimal_only() {
         assert!(may_coerce_to_null(&DataType::Date32));
         assert!(may_coerce_to_null(&DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)));
         assert!(may_coerce_to_null(&DataType::Timestamp(
             arrow_schema::TimeUnit::Microsecond,
             Some("UTC".into())
         )));
+        // Regression test: a NOT NULL Decimal128 column whose declared
+        // precision a source row later overflows must be forced nullable —
+        // same hazard class as the date/timestamp coercions above.
+        assert!(may_coerce_to_null(&DataType::Decimal128(30, 10)));
         // TIME is text (Utf8) in this project — never coerced, so not covered.
         assert!(!may_coerce_to_null(&DataType::Utf8));
         assert!(!may_coerce_to_null(&DataType::Int64));
         assert!(!may_coerce_to_null(&DataType::Boolean));
+        // A genuine Float64 column (no decimal override) is never coerced.
+        assert!(!may_coerce_to_null(&DataType::Float64));
     }
 
     #[test]
@@ -376,6 +397,7 @@ mod tests {
             nullable: true,
             arrow: DataType::Int32,
             clickhouse_inner: "Int32".into(),
+            arbitrary_precision_decimal: false,
         };
         assert_eq!(c.clickhouse_type(), "Nullable(Int32)");
     }
@@ -395,11 +417,14 @@ mod tests {
         assert!(!ch_range::year_in_range(2300));
         assert!(!ch_range::year_in_range(1000)); // legacy MySQL min
         assert!(!ch_range::year_in_range(9999)); // "never expires" sentinel
-        // Day form (Postgres Date32). Endpoints confirmed against CH 24.8.
+        // Day form (Postgres Date32). Endpoints are epoch-day offsets for
+        // 1900-01-01 / 2299-12-31 (independently confirmed: 2299-12-31 is day
+        // 120_529, 2300-01-01 is day 120_530 — regression guard for the
+        // fencepost bug where MAX_DAYS was off by one).
         assert!(ch_range::days_in_range(-25_567)); // 1900-01-01
-        assert!(ch_range::days_in_range(120_530)); // 2299-12-31
+        assert!(ch_range::days_in_range(120_529)); // 2299-12-31
         assert!(!ch_range::days_in_range(-25_568));
-        assert!(!ch_range::days_in_range(120_531));
+        assert!(!ch_range::days_in_range(120_530)); // 2300-01-01 — must be rejected
         // Micro form (Postgres DateTime64): first/last representable instants.
         assert!(ch_range::micros_in_range(ch_range::MIN_MICROS));
         assert!(ch_range::micros_in_range(ch_range::MAX_MICROS));

@@ -101,6 +101,26 @@ Application Default Credentials. As a **destination** it also takes
 `write_method`: the default `"insert_all"` (simple, proven) or the opt-in
 `"storage_write"` (the gRPC Storage Write API — free and higher-throughput).
 
+A ClickHouse destination can also archive every synced batch to S3 as a data
+lake — a secondary, best-effort-free backup independent of ClickHouse's own
+retention:
+
+```python
+qh.ClickHouse(
+    "http://host:8123", database="analytics",
+    archive=qh.S3Archive(bucket="my-data-lake", prefix="quickhouse"),
+)
+```
+
+This streams Parquet — one file per parallel partition, never fully buffered
+in memory — to `s3://{bucket}/{prefix}/{dest_table}/dt=<date>/run=<id>/
+part-<partition>.parquet`, a Hive-style layout directly queryable by Athena,
+Spark, or DuckDB. Credentials fall back to the standard AWS chain (env vars,
+IAM role) unless overridden; pass `endpoint=` for an S3-compatible service
+like MinIO. A persistent upload failure fails the whole `sync()` call, same as
+a ClickHouse insert failure. Storage/request costs are billed by AWS as usual
+(free on a self-hosted MinIO).
+
 The DDL knobs (`engine`, `partition_by`, `order_by`, `primary_key`, `key`) are
 interpreted per destination — for ClickHouse they shape the `MergeTree`
 DDL; for BigQuery they map to partitioning and clustering. quickhouse creates
@@ -114,7 +134,13 @@ atomically — a crash mid-run never leaves the destination partial. For a
 BigQuery destination that swap runs as a query (a billed scan of the staged
 data), not a free copy job — BigQuery's copy jobs can silently skip rows still
 sitting in a table's streaming buffer, so a real query is what keeps this
-correct rather than just fast.
+correct rather than just fast. One accepted tradeoff on the ClickHouse path:
+an insert retried after a lost acknowledgment (not after a crash — the
+transfer is still running) can duplicate one batch's rows in the staging
+table, since `mode="full"` has no engine-level dedup like `ReplacingMergeTree`
+— rare, and harmless for `key`-based incremental syncs, but worth knowing if
+you see an unexpected small over-count on a full-refresh right after a
+transient network blip.
 
 **Incremental** tracks a high-water mark (the `watermark` column) in a small
 state table in the destination and copies only newer rows. Updated rows are
@@ -166,8 +192,14 @@ timestamps across as-is, and booleans preserved. A few deliberate choices worth
 knowing:
 
 - **Arbitrary-precision decimals** (`numeric`/`DECIMAL`/`NUMERIC`) default to
-  `Float64`, since precision can't be recovered from the type alone. Pin an
-  exact type with `type_overrides` (e.g. `"Decimal(18, 2)"`).
+  `Float64`, since precision can't be recovered from the type alone — pin an
+  exact type with `type_overrides` (e.g. `"Decimal(18, 2)"`, `P <= 38`) and the
+  value is decoded exactly (no `Float64` round-trip), not just declared with
+  the right destination type. A value that doesn't fit the declared precision,
+  or is NaN/Infinity (PostgreSQL `numeric` only), coerces to `NULL` with a
+  warning, same as the out-of-range-date handling below. `P > 38`
+  (`Decimal256`) isn't supported yet and is rejected as a config error up
+  front, rather than silently falling back to `Float64`.
 - **`TIME`** columns transfer as canonical text into a `String` column
   (ClickHouse has no time-of-day type).
 - **Out-of-range dates** (and MySQL zero-dates like `0000-00-00`) coerce to

@@ -10,11 +10,17 @@ use std::time::Instant;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use chrono::Utc;
 use futures::StreamExt;
 use mysql_async::prelude::*;
+use object_store::ObjectStore;
 use tokio::task::JoinSet;
 
-use crate::config::{DestinationConfig, SourceConfig, SyncMode, TransferConfig, TransferResult};
+use crate::archive::{archive_object_key, build_s3_store, S3ArchiveWriter};
+use crate::config::{
+    DestinationConfig, ParquetCompression, S3ArchiveConfig, SourceConfig, SyncMode, TransferConfig,
+    TransferResult,
+};
 use crate::decode::CopyDecoder;
 use crate::decode_bigquery::BigQueryBatcher;
 use crate::decode_mysql::MySqlBatcher;
@@ -22,6 +28,7 @@ use crate::error::{EtlError, Result};
 use crate::memory::MemoryBudget;
 use crate::sink::Sink;
 use crate::source::mysql::{quote_my, quote_my_table};
+use crate::source::postgres::quote_pg_table;
 use crate::source::{BigQuerySource, MySqlSource, PgSource, Partition, Source};
 use crate::transform::{self, SelectPlan};
 use crate::types::bigquery::arrow_to_bigquery_type;
@@ -58,6 +65,10 @@ struct SendCtx {
     counters: Arc<Counters>,
     progress: Option<ProgressCb>,
     started: Instant,
+    /// `Some` only for a ClickHouse destination with `s3_archive` configured;
+    /// `None` otherwise (including always for BigQuery). See
+    /// `ArchiveRunInfo::writer_for`.
+    archive: Option<Arc<ArchiveRunInfo>>,
 }
 
 impl SendCtx {
@@ -84,6 +95,45 @@ impl SendCtx {
             Ok(())
         });
     }
+}
+
+/// Static per-run info every partition needs to open its own S3 archive
+/// writer — the S3 client and naming info are shared (built once per
+/// transfer, mirroring `Sink::new`); only the partition label varies.
+struct ArchiveRunInfo {
+    store: Arc<dyn ObjectStore>,
+    prefix: String,
+    dest_table: String,
+    run_date: String,
+    run_id: String,
+    compression: ParquetCompression,
+}
+
+impl ArchiveRunInfo {
+    fn writer_for(&self, partition_label: &str, schema: SchemaRef) -> Result<S3ArchiveWriter> {
+        let key = archive_object_key(&self.prefix, &self.dest_table, &self.run_date, &self.run_id, partition_label);
+        S3ArchiveWriter::new(self.store.clone(), key, schema, self.compression)
+    }
+}
+
+/// Build the shared archive info for one transfer run, or `None` if S3
+/// archival isn't configured. Building the S3 client here — before any
+/// source connection is opened — means a bad archive config (e.g. a missing
+/// bucket) fails fast rather than being discovered mid-transfer.
+fn build_archive_run_info(s3_archive: Option<S3ArchiveConfig>, dest_table: &str) -> Result<Option<Arc<ArchiveRunInfo>>> {
+    let Some(cfg) = s3_archive else {
+        return Ok(None);
+    };
+    let store = build_s3_store(&cfg)?;
+    let now = Utc::now();
+    Ok(Some(Arc::new(ArchiveRunInfo {
+        store,
+        prefix: cfg.prefix,
+        dest_table: dest_table.to_string(),
+        run_date: now.format("%Y-%m-%d").to_string(),
+        run_id: now.timestamp().to_string(),
+        compression: cfg.compression,
+    })))
 }
 
 /// Reap finished upload tasks, propagating the first error. With `block`,
@@ -183,6 +233,16 @@ async fn run_transfer_impl(
         cfg.mode
     );
 
+    // --- Optional S3 data-lake archival (ClickHouse destinations only). ---
+    // Extracted (and cloned) before `Sink::new(dest)` consumes `dest` below —
+    // in either branch — and built once here so a bad archive config (e.g. a
+    // missing bucket) fails fast rather than being discovered mid-transfer.
+    let s3_archive_cfg = match &dest {
+        DestinationConfig::ClickHouse(ch) => ch.s3_archive.clone(),
+        DestinationConfig::BigQuery(_) => None,
+    };
+    let archive_info = build_archive_run_info(s3_archive_cfg, &cfg.dest_table)?;
+
     // BigQuery has a genuinely different execution model (no discrete
     // range-partitions to fan out; a single read session that streams via
     // BigQuery-managed parallel streams, drained sequentially on our side —
@@ -192,7 +252,7 @@ async fn run_transfer_impl(
     if let SourceConfig::BigQuery(bq) = &source_cfg {
         let source = BigQuerySource::new(bq.project_id.clone(), bq.credentials_file.clone());
         let sink = Sink::new(dest).await?;
-        return run_transfer_bigquery(&source, sink, cfg, progress, started).await;
+        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info).await;
     }
 
     let source = Arc::new(match &source_cfg {
@@ -288,6 +348,7 @@ async fn run_transfer_impl(
         counters: counters.clone(),
         progress: progress.clone(),
         started,
+        archive: archive_info.clone(),
     };
 
     let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
@@ -395,6 +456,7 @@ async fn run_transfer_bigquery(
     cfg: TransferConfig,
     progress: Option<ProgressCb>,
     started: Instant,
+    archive_info: Option<Arc<ArchiveRunInfo>>,
 ) -> Result<TransferResult> {
     let (client, project_id) = source.connect().await?;
     tracing::info!("authenticated with bigquery, project_id={project_id}");
@@ -463,6 +525,7 @@ async fn run_transfer_bigquery(
         counters: counters.clone(),
         progress: progress.clone(),
         started,
+        archive: archive_info,
     };
 
     let mut iter = source
@@ -478,18 +541,33 @@ async fn run_transfer_bigquery(
     let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    // No discrete partitions on this path (see the module docs) — "all" is
+    // the only file this run will ever archive for this table.
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for("all", schema.clone())?),
+        None => None,
+    };
     while let Some(row) = iter
         .next()
         .await
         .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
     {
         if let Some(batch) = batcher.append_row(&row)? {
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
             reap(&mut sends, false).await?;
         }
     }
     if let Some(batch) = batcher.finish()? {
+        if let Some(w) = archive_writer.as_mut() {
+            w.write(&batch).await?;
+        }
         ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
     }
     reap(&mut sends, true).await?;
     counters
@@ -497,6 +575,7 @@ async fn run_transfer_bigquery(
         .fetch_add(batcher.rows_total, Ordering::Relaxed);
     emit_progress(&counters, &progress, started);
     warn_coerced_dates("bigquery read", batcher.invalid_dates_total);
+    warn_coerced_decimals("bigquery read", batcher.invalid_decimals_total);
     tracing::info!(
         "bigquery read complete: {} rows written",
         counters.rows_written.load(Ordering::Relaxed)
@@ -554,7 +633,7 @@ async fn setup_postgres(
     let control = s.connect().await?;
     tracing::debug!("postgres connection established");
     let schema_probe = match (base_table, base_query) {
-        (Some(t), _) => format!("SELECT * FROM {}", quote_table(t)),
+        (Some(t), _) => format!("SELECT * FROM {}", quote_pg_table(t)),
         (_, Some(q)) => q.to_string(),
         _ => unreachable!("validated above"),
     };
@@ -656,11 +735,18 @@ async fn transfer_partition_postgres(
     let mut decoder = CopyDecoder::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = decoder.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
+        None => None,
+    };
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let batches = decoder.feed(&chunk)?;
         for batch in batches {
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
         }
         reap(&mut sends, false).await?; // surface any upload error promptly
@@ -672,7 +758,13 @@ async fn transfer_partition_postgres(
         )));
     }
     if let Some(batch) = decoder.finish()? {
+        if let Some(w) = archive_writer.as_mut() {
+            w.write(&batch).await?;
+        }
         ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
     }
     reap(&mut sends, true).await?; // wait for all uploads before returning
 
@@ -682,6 +774,7 @@ async fn transfer_partition_postgres(
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, decoder.rows_total);
     warn_coerced_dates(&format!("partition '{}'", partition.label), decoder.invalid_dates_total);
+    warn_coerced_decimals(&format!("partition '{}'", partition.label), decoder.invalid_decimals_total);
     Ok(())
 }
 
@@ -710,6 +803,10 @@ async fn transfer_partition_mysql(
     let mut batcher = MySqlBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
     let schema = batcher.schema();
     let mut sends: JoinSet<Result<()>> = JoinSet::new();
+    let mut archive_writer = match &ctx.archive {
+        Some(info) => Some(info.writer_for(&partition.label, schema.clone())?),
+        None => None,
+    };
 
     // Use the binary protocol (prepared statement) for actual row fetching,
     // not just for resolve_columns's schema probe: plain query_iter uses the
@@ -733,12 +830,21 @@ async fn transfer_partition_mysql(
     while let Some(row) = stream.next().await {
         let row = row.map_err(|e| EtlError::other(format!("mysql row error: {e}")))?;
         if let Some(batch) = batcher.append_row(row)? {
+            if let Some(w) = archive_writer.as_mut() {
+                w.write(&batch).await?;
+            }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
             reap(&mut sends, false).await?; // surface any upload error promptly
         }
     }
     if let Some(batch) = batcher.finish()? {
+        if let Some(w) = archive_writer.as_mut() {
+            w.write(&batch).await?;
+        }
         ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+    }
+    if let Some(w) = archive_writer.take() {
+        w.close().await?;
     }
     reap(&mut sends, true).await?; // wait for all uploads before returning
 
@@ -748,6 +854,7 @@ async fn transfer_partition_mysql(
     emit_progress(&ctx.counters, &ctx.progress, ctx.started);
     tracing::info!("partition '{}' complete: {} rows", partition.label, batcher.rows_total);
     warn_coerced_dates(&format!("partition '{}'", partition.label), batcher.invalid_dates_total);
+    warn_coerced_decimals(&format!("partition '{}'", partition.label), batcher.invalid_decimals_total);
     Ok(())
 }
 
@@ -761,6 +868,20 @@ fn warn_coerced_dates(scope: &str, n: u64) {
             "{scope}: {n} unrepresentable or out-of-range date/datetime value(s) \
              (zero-dates like '0000-00-00', or years outside ClickHouse's 1900–2299 \
              window like '9999-12-31') coerced to NULL"
+        );
+    }
+}
+
+/// Warn (once per partition / read) when a decoder coerced a NUMERIC/DECIMAL
+/// value to NULL because it overflowed a `Decimal(P,S)` `type_overrides`
+/// entry's precision, or (Postgres only) was NaN/Infinity. Separate from
+/// [`warn_coerced_dates`] — same aggregation rationale, but a distinct
+/// message so the two coercion reasons aren't conflated under one count.
+fn warn_coerced_decimals(scope: &str, n: u64) {
+    if n > 0 {
+        tracing::warn!(
+            "{scope}: {n} decimal value(s) coerced to NULL (value exceeded the declared \
+             Decimal(P,S) precision, or was NaN/Infinity)"
         );
     }
 }
@@ -999,13 +1120,6 @@ fn staging_name(dest: &str) -> String {
     format!("{dest}{STAGING_SUFFIX}")
 }
 
-fn quote_table(table: &str) -> String {
-    match table.split_once('.') {
-        Some((s, t)) => format!("\"{}\".\"{}\"", s.trim_matches('"'), t.trim_matches('"')),
-        None => format!("\"{}\"", table.trim_matches('"')),
-    }
-}
-
 fn build_watermark_filter_pg(
     watermark: &str,
     last: Option<&str>,
@@ -1014,7 +1128,8 @@ fn build_watermark_filter_pg(
 ) -> Option<String> {
     let col = format!("\"{}\"", watermark.replace('"', "\"\""));
     let lower = last.map(|l| lookback_lower_bound_pg(l, lookback_seconds));
-    build_watermark_filter(&col, lower, snapshot_max)
+    let upper = snapshot_max.map(quote_sql_literal);
+    build_watermark_filter(&col, lower, upper)
 }
 
 fn build_watermark_filter_mysql(
@@ -1024,15 +1139,39 @@ fn build_watermark_filter_mysql(
     lookback_seconds: u64,
 ) -> Option<String> {
     let lower = last.map(|l| lookback_lower_bound_mysql(l, lookback_seconds));
-    build_watermark_filter(&quote_my(watermark), lower, snapshot_max)
+    let upper = snapshot_max.map(quote_mysql_literal);
+    build_watermark_filter(&quote_my(watermark), lower, upper)
+}
+
+/// Postgres, under the default `standard_conforming_strings = on`, treats
+/// backslash as a plain literal character inside a `'...'` string — only the
+/// doubled-quote convention is active, so this must NOT also escape
+/// backslash (doing so would double every literal backslash in the actual
+/// compared value, corrupting the match instead of protecting it).
+fn quote_sql_literal(m: &str) -> String {
+    format!("'{}'", m.replace('\'', "''"))
+}
+
+/// Unlike Postgres, MySQL treats backslash as an active escape character in
+/// string literals by default (`NO_BACKSLASH_ESCAPES` is off unless a user
+/// opts in), so — same failure mode as bigquery.rs's `escape_sql_string` — a
+/// trailing backslash in a value would escape the literal's closing quote
+/// instead of terminating the string unless backslash is escaped first.
+fn quote_mysql_literal(m: &str) -> String {
+    format!("'{}'", m.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// BigQuery Standard SQL uses the same backtick identifier quoting as MySQL.
-/// `source_cols` resolves the watermark column's BigQuery type
-/// (DATE/DATETIME/TIMESTAMP each need their own `_SUB` function and typed
-/// literal — BigQuery won't implicitly compare across them); only looked up
-/// when `lookback_seconds > 0` (`ensure_lookback_compatible` has already run
-/// by the time this is called, so the lookup is guaranteed to succeed).
+/// `source_cols` resolves the watermark column's BigQuery type, needed for
+/// two independent reasons: (1) the lookback lower bound's `_SUB` function
+/// (DATE/DATETIME/TIMESTAMP each need their own — BigQuery won't implicitly
+/// compare across them), only relevant when `lookback_seconds > 0`
+/// (`ensure_lookback_compatible` has already validated a temporal type by the
+/// time this runs); (2) the upper bound's CAST — BigQuery only implicitly
+/// coerces an untyped STRING literal against DATE/DATETIME/TIME/TIMESTAMP,
+/// NOT against INT64/NUMERIC/FLOAT64/BOOL, so a plain (non-lookback)
+/// incremental sync against a numeric watermark column needs the type
+/// resolved unconditionally, not just when lookback is active.
 fn build_watermark_filter_bigquery(
     watermark: &str,
     last: Option<&str>,
@@ -1040,18 +1179,59 @@ fn build_watermark_filter_bigquery(
     lookback_seconds: u64,
     source_cols: &[ColumnType],
 ) -> Option<String> {
+    let bq_type = source_cols
+        .iter()
+        .find(|c| c.name == watermark)
+        .and_then(|c| arrow_to_bigquery_type(&c.arrow));
     let lower = last.map(|l| {
-        let bq_type = if lookback_seconds > 0 {
-            source_cols
-                .iter()
-                .find(|c| c.name == watermark)
-                .and_then(|c| arrow_to_bigquery_type(&c.arrow))
-        } else {
-            None
-        };
-        lookback_lower_bound_bigquery(l, lookback_seconds, bq_type)
+        let lb_type = if lookback_seconds > 0 { bq_type.clone() } else { None };
+        lookback_lower_bound_bigquery(l, lookback_seconds, lb_type)
     });
-    build_watermark_filter(&quote_my(watermark), lower, snapshot_max)
+    let upper = snapshot_max.map(|m| bigquery_typed_upper_bound(m, bq_type));
+    build_watermark_filter(&quote_my(watermark), lower, upper)
+}
+
+/// CAST-wrap the upper-bound literal in the watermark column's own resolved
+/// BigQuery type rather than emitting a bare quoted STRING — sidesteps every
+/// per-type literal-syntax quirk (e.g. BOOL's `TRUE`/`FALSE` keywords) with
+/// one mechanism that GoogleSQL supports uniformly from a STRING literal.
+fn bigquery_typed_upper_bound(value: &str, bq_type: Option<TableFieldType>) -> String {
+    let escaped = escape_bigquery_string(value);
+    match bq_type {
+        Some(t) => format!("CAST('{escaped}' AS {})", bq_cast_type_name(&t)),
+        None => format!("'{escaped}'"),
+    }
+}
+
+/// GoogleSQL string literals only recognize backslash-based escapes — unlike
+/// ANSI SQL's doubled-quote convention (`''`), a doubled single quote is NOT
+/// an escaped quote in BigQuery and is rejected as a syntax error (this is a
+/// well-documented real-world gotcha when porting ANSI-style SQL generation
+/// to BigQuery, e.g. https://github.com/trinodb/trino/issues/7784). Backslash
+/// must be escaped first, same reasoning as `sink/bigquery.rs`'s
+/// `escape_sql_string` (kept in sync with that function deliberately).
+fn escape_bigquery_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn bq_cast_type_name(t: &TableFieldType) -> &'static str {
+    match t {
+        TableFieldType::Boolean | TableFieldType::Bool => "BOOL",
+        TableFieldType::Integer | TableFieldType::Int64 => "INT64",
+        TableFieldType::Float | TableFieldType::Float64 => "FLOAT64",
+        TableFieldType::Bytes => "BYTES",
+        TableFieldType::Date => "DATE",
+        TableFieldType::Datetime => "DATETIME",
+        TableFieldType::Timestamp => "TIMESTAMP",
+        TableFieldType::Time => "TIME",
+        TableFieldType::Numeric => "NUMERIC",
+        TableFieldType::Bignumeric | TableFieldType::Decimal | TableFieldType::Bigdecimal => "BIGNUMERIC",
+        TableFieldType::String
+        | TableFieldType::Json
+        | TableFieldType::Record
+        | TableFieldType::Struct
+        | TableFieldType::Interval => "STRING",
+    }
 }
 
 /// Widen `last`'s lower bound by `lookback_seconds` using Postgres's own
@@ -1068,7 +1248,7 @@ fn lookback_lower_bound_pg(last: &str, lookback_seconds: u64) -> String {
 }
 
 fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
-    let l = last.replace('\'', "''");
+    let l = last.replace('\\', "\\\\").replace('\'', "''");
     if lookback_seconds == 0 {
         return format!("'{l}'");
     }
@@ -1080,7 +1260,7 @@ fn lookback_lower_bound_mysql(last: &str, lookback_seconds: u64) -> String {
 /// documented behavior, not silently wrong (a 1-hour lookback on a DATE
 /// column re-includes the whole prior day, not nothing).
 fn lookback_lower_bound_bigquery(last: &str, lookback_seconds: u64, bq_type: Option<TableFieldType>) -> String {
-    let l = last.replace('\'', "''");
+    let l = escape_bigquery_string(last);
     if lookback_seconds == 0 {
         return format!("'{l}'");
     }
@@ -1101,13 +1281,13 @@ fn lookback_lower_bound_bigquery(last: &str, lookback_seconds: u64, bq_type: Opt
     }
 }
 
-fn build_watermark_filter(col: &str, lower_bound: Option<String>, snapshot_max: Option<&str>) -> Option<String> {
+fn build_watermark_filter(col: &str, lower_bound: Option<String>, upper_bound: Option<String>) -> Option<String> {
     let mut clauses = Vec::new();
     if let Some(lb) = lower_bound {
         clauses.push(format!("{col} > {lb}"));
     }
-    if let Some(m) = snapshot_max {
-        clauses.push(format!("{col} <= '{}'", m.replace('\'', "''")));
+    if let Some(ub) = upper_bound {
+        clauses.push(format!("{col} <= {ub}"));
     }
     if clauses.is_empty() {
         None
@@ -1132,6 +1312,7 @@ mod tests {
             nullable: true,
             arrow,
             clickhouse_inner: "Int64".into(),
+            arbitrary_precision_decimal: false,
         }
     }
 
@@ -1192,11 +1373,48 @@ mod tests {
             build_watermark_filter_mysql("write_date", Some("2024-01-01"), Some("2024-06-01"), 0),
             Some("`write_date` > '2024-01-01' AND `write_date` <= '2024-06-01'".to_string())
         );
+        // BigQuery's upper bound is CAST-typed regardless of lookback state
+        // (a separate, unconditional fix — see
+        // watermark_filter_bigquery_casts_numeric_upper_bound below), so this
+        // one isn't byte-identical to the plain-quoted pg/mysql shape above.
         let cols = vec![col_typed("write_date", DataType::Date32)];
         assert_eq!(
             build_watermark_filter_bigquery("write_date", Some("2024-01-01"), Some("2024-06-01"), 0, &cols),
-            Some("`write_date` > '2024-01-01' AND `write_date` <= '2024-06-01'".to_string())
+            Some("`write_date` > '2024-01-01' AND `write_date` <= CAST('2024-06-01' AS DATE)".to_string())
         );
+    }
+
+    #[test]
+    fn watermark_filter_bigquery_casts_numeric_upper_bound() {
+        // Regression test (bug report): a numeric (INT64) watermark column's
+        // upper bound was always emitted as a bare quoted STRING literal,
+        // which BigQuery rejects for INT64 with "No matching signature for
+        // operator <= for argument types: INT64, STRING" — reproduced live
+        // against real BigQuery in the report. Every plain (non-lookback)
+        // incremental sync with an id-based watermark hit this on every run.
+        let cols = vec![col_typed("uor_id", DataType::Int64)];
+        let f = build_watermark_filter_bigquery("uor_id", Some("100"), Some("500"), 0, &cols).unwrap();
+        assert_eq!(f, "`uor_id` > '100' AND `uor_id` <= CAST('500' AS INT64)");
+    }
+
+    #[test]
+    fn watermark_filter_bigquery_escapes_backslash_before_quote() {
+        // Regression test: GoogleSQL doesn't support the ANSI doubled-quote
+        // escape ('') at all, and treats backslash as an active escape
+        // character — so a value with a quote or a trailing backslash needs
+        // backslash-first escaping, not quote-doubling.
+        let cols = vec![col_typed("note", DataType::Utf8)];
+        let f = build_watermark_filter_bigquery("note", None, Some(r"a'b\"), 0, &cols).unwrap();
+        assert_eq!(f, r"`note` <= CAST('a\'b\\' AS STRING)");
+    }
+
+    #[test]
+    fn watermark_filter_mysql_escapes_backslash_before_quote() {
+        // Regression test: MySQL (unlike Postgres) treats backslash as an
+        // active string-literal escape by default, so the same
+        // trailing-backslash-swallows-the-quote failure mode applies here.
+        let f = build_watermark_filter_mysql("note", None, Some(r"a'b\"), 0).unwrap();
+        assert_eq!(f, r"`note` <= 'a''b\\'");
     }
 
     #[test]

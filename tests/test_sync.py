@@ -376,6 +376,88 @@ def test_column_mapping(pg_conn, ch_client, pg_source, ch_target, unique_name):
         _drop_ch(ch_client, table)
 
 
+def test_full_refresh_decimal_override_preserves_exact_precision(
+    pg_conn, ch_client, pg_source, ch_target, unique_name
+):
+    """Regression test (bug report): `type_overrides={"col": "Decimal(P,S)"}`
+    previously only changed the destination DDL type -- the value itself
+    still went through a lossy Float64 round-trip before ever reaching
+    ClickHouse, silently corrupting exact NUMERIC values beyond ~15-17
+    significant digits despite the destination column being correctly typed.
+    Also covers PostgreSQL numeric's NaN/Infinity/-Infinity sentinels (only
+    NaN was previously even checked) and precision overflow on a NOT NULL
+    column (proving it's forced nullable, so the coercion doesn't abort the
+    whole transfer with an Arrow schema-consistency error)."""
+    table = unique_name
+    with pg_conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        # amount_wide is a bare (unconstrained) numeric: PostgreSQL rejects
+        # Infinity/-Infinity outright in a precision/scale-constrained
+        # numeric(P,S) column ("numeric field overflow ... cannot hold an
+        # infinite value") even though NaN is accepted there -- confirmed
+        # live against this project's postgres:16 container.
+        cur.execute(
+            f"""
+            CREATE TABLE "{table}" (
+                id            bigint PRIMARY KEY,
+                amount_wide   numeric,
+                amount_narrow numeric(10, 2) NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            INSERT INTO "{table}" (id, amount_wide, amount_narrow) VALUES
+                (1, 123456789012345.6789012345, 12.34),
+                (2, 'NaN', 1.00),
+                (3, 'Infinity', 2.00),
+                (4, '-Infinity', 3.00),
+                (5, NULL, 12345.67)
+            """
+        )
+    _drop_ch(ch_client, table)
+    try:
+        result = quickhouse.sync(
+            pg_source,
+            ch_target,
+            dest_table=table,
+            source_table=table,
+            mode="full",
+            key=["id"],
+            create_if_missing=True,
+            type_overrides={"amount_wide": "Decimal(30, 10)", "amount_narrow": "Decimal(5, 2)"},
+        )
+        assert result.rows_written == 5
+
+        col_types = {
+            row[0]: row[1]
+            for row in ch_client.query(
+                f"SELECT name, type FROM system.columns "
+                f"WHERE database = currentDatabase() AND table = '{table}'"
+            ).result_rows
+        }
+        assert "Nullable" in col_types["amount_wide"] and "Decimal(30, 10)" in col_types["amount_wide"]
+        # amount_narrow is NOT NULL in Postgres but must be forced Nullable in
+        # the destination: a Decimal128 value can be coerced to NULL on
+        # overflow (see types::may_coerce_to_null).
+        assert "Nullable" in col_types["amount_narrow"] and "Decimal(5, 2)" in col_types["amount_narrow"]
+
+        rows = {
+            row[0]: (row[1], row[2])
+            for row in ch_client.query(
+                f"SELECT id, toString(amount_wide), toString(amount_narrow) FROM `{table}` ORDER BY id"
+            ).result_rows
+        }
+        assert rows[1] == ("123456789012345.6789012345", "12.34")
+        assert rows[2][0] is None, "NaN must coerce to NULL"
+        assert rows[3][0] is None, "Infinity must coerce to NULL"
+        assert rows[4][0] is None, "-Infinity must coerce to NULL"
+        assert rows[5][0] is None, "source NULL stays NULL"
+        assert rows[5][1] is None, "12345.67 overflows Decimal(5,2)'s max of 999.99"
+    finally:
+        _drop_ch(ch_client, table)
+
+
 def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)

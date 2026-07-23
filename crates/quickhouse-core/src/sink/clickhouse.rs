@@ -101,8 +101,8 @@ impl ClickHouseSink {
              WHERE source_table = '{}' AND dest_table = '{}' \
              ORDER BY run_ts DESC LIMIT 1",
             crate::ddl::quote_ident(&self.cfg.database),
-            source_id.replace('\'', "''"),
-            cfg.dest_table.replace('\'', "''"),
+            escape_sql_string(&source_id),
+            escape_sql_string(&cfg.dest_table),
         );
         self.query_scalar(&sql).await
     }
@@ -118,9 +118,9 @@ impl ClickHouseSink {
             "INSERT INTO {}.`_quickhouse_state` (source_table, dest_table, last_watermark, rows) \
              VALUES ('{}', '{}', '{}', {})",
             crate::ddl::quote_ident(&self.cfg.database),
-            source_id.replace('\'', "''"),
-            cfg.dest_table.replace('\'', "''"),
-            watermark.replace('\'', "''"),
+            escape_sql_string(&source_id),
+            escape_sql_string(&cfg.dest_table),
+            escape_sql_string(watermark),
             rows,
         );
         self.execute(&sql).await
@@ -271,6 +271,17 @@ fn ident(name: &str) -> String {
     crate::ddl::quote_ident(name)
 }
 
+/// Escape a value for a single-quoted ClickHouse string literal. Backslash
+/// must be escaped *first* — otherwise a value ending in a backslash (e.g. a
+/// table/query name or watermark value with a trailing `\`) escapes the
+/// literal's closing quote instead of terminating the string, breaking every
+/// query built from it (independently verified against a real ClickHouse
+/// server: `SELECT 'ends_with_backslash\'` fails with "Code: 62. Single
+/// quoted string is not closed").
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
 /// Serialize batches to an in-memory Arrow IPC stream.
 fn serialize_ipc(schema: SchemaRef, batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
@@ -324,4 +335,24 @@ fn zstd_body(payload: Bytes, counter: Arc<AtomicU64>) -> reqwest::Body {
     let enc = ZstdEncoder::new(BufReader::new(std::io::Cursor::new(payload)));
     let stream = ReaderStream::new(enc);
     reqwest::Body::wrap_stream(count_stream(stream, counter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_sql_string_doubles_quotes() {
+        assert_eq!(escape_sql_string("o'brien"), "o''brien");
+    }
+
+    #[test]
+    fn escape_sql_string_escapes_backslash_before_quote() {
+        // Regression test: a trailing backslash used to escape the literal's
+        // closing quote instead of terminating the string (verified against
+        // a real ClickHouse server: `SELECT 'ends_with_backslash\'` fails
+        // with "Code: 62. Single quoted string is not closed").
+        assert_eq!(escape_sql_string(r"a\b"), r"a\\b");
+        assert_eq!(escape_sql_string(r"ends_with_backslash\"), r"ends_with_backslash\\");
+    }
 }

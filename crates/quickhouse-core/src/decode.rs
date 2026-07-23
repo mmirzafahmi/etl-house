@@ -14,12 +14,14 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
+    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
+    Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder, UInt32Builder,
 };
+use arrow_array::types::{Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
+use crate::decimal::{rescale_mantissa, Coercion};
 use crate::error::{EtlError, Result};
 use crate::types::{ch_range, oid, ColumnType};
 
@@ -44,6 +46,7 @@ enum ColBuilder {
     Bin(BinaryBuilder),
     Date(Date32Builder),
     Ts(TimestampMicrosecondBuilder, Option<Arc<str>>),
+    Decimal128(Decimal128Builder, u8, i8),
 }
 
 impl ColBuilder {
@@ -62,6 +65,11 @@ impl ColBuilder {
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 ColBuilder::Ts(TimestampMicrosecondBuilder::new(), tz.clone())
             }
+            DataType::Decimal128(p, s) => ColBuilder::Decimal128(
+                Decimal128Builder::new().with_precision_and_scale(*p, *s)?,
+                *p,
+                *s,
+            ),
             other => {
                 // Reachable only if types.rs maps some OID to an Arrow type
                 // this decoder doesn't implement a builder for — a mapping/
@@ -86,18 +94,23 @@ impl ColBuilder {
             ColBuilder::Bin(b) => b.append_null(),
             ColBuilder::Date(b) => b.append_null(),
             ColBuilder::Ts(b, _) => b.append_null(),
+            ColBuilder::Decimal128(b, _, _) => b.append_null(),
         }
     }
 
     /// Decode a non-NULL field's raw binary bytes for the given PostgreSQL OID.
     ///
-    /// Returns `true` if the value was a valid date/datetime whose year is
-    /// outside ClickHouse's representable window ([`ch_range`]) and so was
-    /// coerced to NULL rather than sent on to be rejected at insert time (which
-    /// would abort the whole transfer). PostgreSQL's DATE/TIMESTAMP range is far
-    /// wider than ClickHouse's, so this is reachable with ordinary data.
-    fn append_value(&mut self, pg_oid: u32, buf: &[u8]) -> Result<bool> {
-        let mut coerced_to_null = false;
+    /// Returns [`Coercion::DateRange`] if the value was a valid date/datetime
+    /// whose year is outside ClickHouse's representable window ([`ch_range`])
+    /// and so was coerced to NULL rather than sent on to be rejected at
+    /// insert time (which would abort the whole transfer) — PostgreSQL's
+    /// DATE/TIMESTAMP range is far wider than ClickHouse's, so this is
+    /// reachable with ordinary data. Returns [`Coercion::DecimalOverflow`]
+    /// for a `numeric` value that doesn't fit the declared `Decimal(P,S)`
+    /// override's precision, or is NaN/Infinity (`numeric` supports both;
+    /// neither has a finite `Decimal128` representation).
+    fn append_value(&mut self, pg_oid: u32, buf: &[u8]) -> Result<Coercion> {
+        let mut coercion = Coercion::None;
         match self {
             ColBuilder::Bool(b) => b.append_value(buf.first().map(|&x| x != 0).unwrap_or(false)),
             ColBuilder::I16(b) => b.append_value(read_i16(buf)?),
@@ -139,7 +152,7 @@ impl ColBuilder {
                     b.append_value(days);
                 } else {
                     b.append_null();
-                    coerced_to_null = true;
+                    coercion = Coercion::DateRange;
                 }
             }
             ColBuilder::Ts(b, _) => {
@@ -148,11 +161,34 @@ impl ColBuilder {
                     b.append_value(micros);
                 } else {
                     b.append_null();
-                    coerced_to_null = true;
+                    coercion = Coercion::DateRange;
                 }
             }
+            ColBuilder::Decimal128(b, p, s) => match parse_numeric_wire(buf)? {
+                NumericWire::NanOrInf | NumericWire::MagnitudeOverflow => {
+                    b.append_null();
+                    coercion = Coercion::DecimalOverflow;
+                }
+                NumericWire::Value { negative, magnitude, native_scale } => {
+                    match rescale_mantissa(magnitude, native_scale, *s as i32) {
+                        Some(m) => {
+                            let signed = if negative { -m } else { m };
+                            if Decimal128Type::is_valid_decimal_precision(signed, *p) {
+                                b.append_value(signed);
+                            } else {
+                                b.append_null();
+                                coercion = Coercion::DecimalOverflow;
+                            }
+                        }
+                        None => {
+                            b.append_null();
+                            coercion = Coercion::DecimalOverflow;
+                        }
+                    }
+                }
+            },
         }
-        Ok(coerced_to_null)
+        Ok(coercion)
     }
 
     fn finish(&mut self) -> ArrayRef {
@@ -174,6 +210,7 @@ impl ColBuilder {
                     None => Arc::new(arr),
                 }
             }
+            ColBuilder::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
     }
 }
@@ -215,8 +252,9 @@ fn read_i64(buf: &[u8]) -> Result<i64> {
         .ok_or_else(|| EtlError::internal(format!("expected an 8-byte int8 field, got {} byte(s)", buf.len())))
 }
 
-/// Decode PostgreSQL's `numeric` binary form to `f64` (approximate; exact
-/// arbitrary precision is intentionally out of scope for v1).
+/// Decode PostgreSQL's `numeric` binary form to `f64` (approximate; used
+/// only when no `Decimal(P,S)` override applies — see `parse_numeric_wire`
+/// for the exact-precision path).
 fn decode_numeric(buf: &[u8]) -> Result<f64> {
     if buf.len() < 8 {
         return Err(EtlError::internal(format!(
@@ -228,8 +266,16 @@ fn decode_numeric(buf: &[u8]) -> Result<f64> {
     let weight = i16::from_be_bytes([buf[2], buf[3]]) as i32;
     let sign = u16::from_be_bytes([buf[4], buf[5]]);
     // buf[6..8] = dscale (display scale) — not needed for an f64 value.
-    if sign == 0xC000 {
-        return Ok(f64::NAN);
+    // 0xC000/0xD000/0xF000 are PostgreSQL's NaN/+Infinity/-Infinity
+    // sentinels (the latter two added in PG14) — previously only NaN was
+    // checked here, so a real `Infinity`/`-Infinity` numeric value silently
+    // fell through the digit loop below (which sees no digit bytes, since
+    // these sentinels carry `ndigits=0`) and decoded to a plain `0.0`.
+    match sign {
+        0xC000 => return Ok(f64::NAN),
+        0xD000 => return Ok(f64::INFINITY),
+        0xF000 => return Ok(f64::NEG_INFINITY),
+        _ => {}
     }
     if buf.len() < 8 + ndigits * 2 {
         return Err(EtlError::internal(format!(
@@ -249,6 +295,65 @@ fn decode_numeric(buf: &[u8]) -> Result<f64> {
         value = -value;
     }
     Ok(value)
+}
+
+/// A PostgreSQL `numeric` binary payload parsed exactly (no `f64` round
+/// trip): either a finite sign/magnitude/scale, or a non-finite sentinel.
+/// `MagnitudeOverflow` covers a value with more base-10000 digits than fit
+/// in an i128 even before any rescaling is attempted — the same "too large
+/// for any Decimal128" category as a post-rescale precision overflow (see
+/// `append_value`'s `ColBuilder::Decimal128` arm), not a hard error.
+enum NumericWire {
+    Value { negative: bool, magnitude: i128, native_scale: i32 },
+    MagnitudeOverflow,
+    NanOrInf,
+}
+
+/// Parse PostgreSQL's `numeric` binary wire format — header
+/// (`ndigits:i16, weight:i16, sign:u16, dscale:i16`), then `ndigits`
+/// big-endian `i16` base-10000 digits — into an exact `(sign, magnitude,
+/// native_scale)`. `magnitude` is the digits read as one big base-10000
+/// integer (Horner's method: `magnitude = magnitude*10000 + digit`, digits
+/// in wire order from most to least significant); at that construction,
+/// `magnitude` is the unscaled value at `native_scale = (ndigits - 1 -
+/// weight) * 4` (a multiple of 4, and possibly negative for a large whole
+/// number) — see `rescale_mantissa` to convert to an arbitrary target scale.
+fn parse_numeric_wire(buf: &[u8]) -> Result<NumericWire> {
+    if buf.len() < 8 {
+        return Err(EtlError::internal(format!(
+            "truncated numeric header: expected at least 8 bytes, got {}",
+            buf.len()
+        )));
+    }
+    let ndigits = i16::from_be_bytes([buf[0], buf[1]]) as usize;
+    let weight = i16::from_be_bytes([buf[2], buf[3]]) as i32;
+    let sign = u16::from_be_bytes([buf[4], buf[5]]);
+    // buf[6..8] = dscale — irrelevant here; the target scale comes from the
+    // Decimal128(P,S) override, not the source's own display scale.
+    if matches!(sign, 0xC000 | 0xD000 | 0xF000) {
+        return Ok(NumericWire::NanOrInf);
+    }
+    if buf.len() < 8 + ndigits * 2 {
+        return Err(EtlError::internal(format!(
+            "truncated numeric digits: expected {} more byte(s), got {}",
+            8 + ndigits * 2,
+            buf.len()
+        )));
+    }
+    let mut magnitude: i128 = 0;
+    for i in 0..ndigits {
+        let off = 8 + i * 2;
+        let digit = i16::from_be_bytes([buf[off], buf[off + 1]]) as i128;
+        magnitude = match magnitude.checked_mul(10_000).and_then(|m| m.checked_add(digit)) {
+            Some(m) => m,
+            None => return Ok(NumericWire::MagnitudeOverflow),
+        };
+    }
+    Ok(NumericWire::Value {
+        negative: sign == 0x4000,
+        magnitude,
+        native_scale: (ndigits as i32 - 1 - weight) * 4,
+    })
 }
 
 /// Result of trying to parse a single tuple from the front of the buffer.
@@ -277,6 +382,10 @@ pub struct CopyDecoder {
     /// Count of valid dates/datetimes whose year fell outside ClickHouse's
     /// representable window and were coerced to NULL (see `ColBuilder::append_value`).
     pub invalid_dates_total: u64,
+    /// Count of `numeric` values coerced to NULL because they overflowed a
+    /// `Decimal(P,S)` override's precision, or were NaN/Infinity (see
+    /// `ColBuilder::append_value`'s `Decimal128` arm).
+    pub invalid_decimals_total: u64,
 }
 
 impl CopyDecoder {
@@ -306,6 +415,7 @@ impl CopyDecoder {
             batch_bytes,
             rows_total: 0,
             invalid_dates_total: 0,
+            invalid_decimals_total: 0,
         })
     }
 
@@ -445,11 +555,13 @@ impl CopyDecoder {
                 None => self.builders[i].append_null(),
                 Some((s, e)) => {
                     let oid = self.oids[i];
-                    let coerced = self.builders[i]
+                    let coercion = self.builders[i]
                         .append_value(oid, &self.buf[*s..*e])
                         .map_err(|err| err.context(format!("column '{}'", self.schema.field(i).name())))?;
-                    if coerced {
-                        self.invalid_dates_total += 1;
+                    match coercion {
+                        Coercion::None => {}
+                        Coercion::DateRange => self.invalid_dates_total += 1,
+                        Coercion::DecimalOverflow => self.invalid_decimals_total += 1,
                     }
                 }
             }
@@ -471,6 +583,7 @@ mod tests {
             nullable,
             arrow: dt,
             clickhouse_inner: "x".into(),
+            arbitrary_precision_decimal: false,
         }
     }
 
@@ -605,5 +718,102 @@ mod tests {
             batches.push(b);
         }
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// Build a PostgreSQL `numeric` binary payload: header
+    /// (ndigits/weight/sign/dscale=0) followed by `digits`, each a
+    /// base-10000 group in `[0, 9999]`.
+    fn numeric_wire(weight: i16, sign: u16, digits: &[i16]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(digits.len() as i16).to_be_bytes());
+        v.extend_from_slice(&weight.to_be_bytes());
+        v.extend_from_slice(&sign.to_be_bytes());
+        v.extend_from_slice(&0i16.to_be_bytes()); // dscale — unused by parse_numeric_wire
+        for d in digits {
+            v.extend_from_slice(&d.to_be_bytes());
+        }
+        v
+    }
+
+    fn decimal_value(b: &mut ColBuilder, buf: &[u8]) -> (Coercion, ArrayRef) {
+        let coercion = b.append_value(oid::NUMERIC, buf).unwrap();
+        (coercion, b.finish())
+    }
+
+    #[test]
+    fn decimal_decodes_exact_value_with_no_rounding_needed() {
+        // digits=[12, 3400], weight=0 -> native_scale=4, magnitude=123400,
+        // i.e. the value 12.3400. Target scale matches native scale exactly.
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[12, 3400]));
+        assert_eq!(coercion, Coercion::None);
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 123_400);
+    }
+
+    #[test]
+    fn decimal_rounds_half_away_from_zero_when_narrowing() {
+        // Same shape as above but digits=[12, 3450] (12.3450), narrowed to
+        // scale 2: 123450 / 100 = 1234 remainder 50 -> rounds up to 1235
+        // (12.35), not truncated to 1234 (12.34).
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[12, 3450]));
+        assert_eq!(coercion, Coercion::None);
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 1235);
+    }
+
+    #[test]
+    fn decimal_negative_value_round_trips_exactly() {
+        let mut b = ColBuilder::new(&DataType::Decimal128(10, 4)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x4000, &[12, 3400]));
+        assert_eq!(coercion, Coercion::None);
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), -123_400);
+    }
+
+    #[test]
+    fn decimal_coerces_to_null_when_value_overflows_declared_precision() {
+        // 1234 (a 4-digit whole number) doesn't fit Decimal(3, 0)'s max of 999.
+        let mut b = ColBuilder::new(&DataType::Decimal128(3, 0)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[1234]));
+        assert_eq!(coercion, Coercion::DecimalOverflow);
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert!(arr.is_null(0));
+    }
+
+    #[test]
+    fn decimal_coerces_nan_and_infinity_to_null() {
+        for sign in [0xC000u16, 0xD000, 0xF000] {
+            let mut b = ColBuilder::new(&DataType::Decimal128(10, 2)).unwrap();
+            let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, sign, &[]));
+            assert_eq!(coercion, Coercion::DecimalOverflow, "sign {sign:#06x}");
+            let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+            assert!(arr.is_null(0), "sign {sign:#06x}");
+        }
+    }
+
+    #[test]
+    fn decimal_zero_does_not_overflow_at_a_wide_target_scale() {
+        // Regression test: PostgreSQL encodes a literal zero as ndigits=0,
+        // weight=0, giving native_scale=-4. Rescaling that to a wide target
+        // scale (e.g. 30) previously (without rescale_mantissa's zero
+        // short-circuit) needed 10^34, overflowing i128 and wrongly nulling
+        // out a plain zero.
+        let mut b = ColBuilder::new(&DataType::Decimal128(38, 30)).unwrap();
+        let (coercion, arr) = decimal_value(&mut b, &numeric_wire(0, 0x0000, &[]));
+        assert_eq!(coercion, Coercion::None);
+        let arr = arr.as_any().downcast_ref::<arrow_array::Decimal128Array>().unwrap();
+        assert_eq!(arr.value(0), 0);
+    }
+
+    #[test]
+    fn decode_numeric_f64_fallback_handles_nan_and_infinity() {
+        // The plain (non-overridden) Float64 path: previously only NaN was
+        // checked, so a real Infinity/-Infinity value silently decoded to
+        // 0.0 instead of representing it (or erroring).
+        assert!(decode_numeric(&numeric_wire(0, 0xC000, &[])).unwrap().is_nan());
+        assert_eq!(decode_numeric(&numeric_wire(0, 0xD000, &[])).unwrap(), f64::INFINITY);
+        assert_eq!(decode_numeric(&numeric_wire(0, 0xF000, &[])).unwrap(), f64::NEG_INFINITY);
     }
 }

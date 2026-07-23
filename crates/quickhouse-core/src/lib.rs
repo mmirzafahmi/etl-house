@@ -11,6 +11,7 @@
 //! [`run_transfer_blocking`] for callers without an async runtime.
 
 pub mod config;
+mod decimal;
 pub mod ddl;
 pub mod decode;
 pub mod decode_bigquery;
