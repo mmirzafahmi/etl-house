@@ -458,6 +458,70 @@ def test_full_refresh_decimal_override_preserves_exact_precision(
         _drop_ch(ch_client, table)
 
 
+def _staging_orphans(ch_client, table: str) -> list[str]:
+    """Any leftover `{table}_quickhouse_tmp*` staging tables in the current DB.
+    (`table` is a test-generated unique_name, so f-string interpolation here is
+    safe from injection.)"""
+    return [
+        row[0]
+        for row in ch_client.query(
+            f"SELECT name FROM system.tables "
+            f"WHERE database = currentDatabase() AND name LIKE '{table}_quickhouse_tmp%' ORDER BY name"
+        ).result_rows
+    ]
+
+
+def test_full_refresh_leaves_no_staging_orphan(pg_conn, ch_client, pg_source, ch_target, unique_name):
+    """A successful full refresh must drop its per-run staging table — with
+    per-run-unique staging names (bug 10 fix) nothing else ever reclaims them,
+    so a leak here would accumulate forever."""
+    table = unique_name
+    _seed_table(pg_conn, table, 100)
+    _drop_ch(ch_client, table)
+    try:
+        quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True, parallelism=4,
+        )
+        orphans = _staging_orphans(ch_client, table)
+        assert orphans == [], f"staging table(s) left behind after a successful run: {orphans}"
+    finally:
+        _drop_ch(ch_client, table)
+        for name in _staging_orphans(ch_client, table):
+            ch_client.command(f"DROP TABLE IF EXISTS `{name}`")
+
+
+def test_rapid_successive_full_refreshes_both_succeed(pg_conn, ch_client, pg_source, ch_target, unique_name):
+    """Two back-to-back full refreshes into the same destination both succeed
+    and reconcile. This is the pattern bug 10 broke on BigQuery (fixed-name
+    staging drop+recreate blocked streaming on the immediate second run);
+    ClickHouse shares the exact staging-name code path, so this exercises the
+    per-run-unique-name plumbing end-to-end against a real sink."""
+    table = unique_name
+    _drop_ch(ch_client, table)
+    try:
+        _seed_table(pg_conn, table, 100)
+        r1 = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        assert r1.rows_written == 100
+
+        # Immediate second run (different data) into the same dest.
+        _seed_table(pg_conn, table, 150)
+        r2 = quickhouse.sync(
+            pg_source, ch_target, dest_table=table, source_table=table,
+            mode="full", key=["id"], create_if_missing=True,
+        )
+        assert r2.rows_written == 150
+        assert int(ch_client.command(f"SELECT count() FROM `{table}`")) == 150
+        assert _staging_orphans(ch_client, table) == []
+    finally:
+        _drop_ch(ch_client, table)
+        for name in _staging_orphans(ch_client, table):
+            ch_client.command(f"DROP TABLE IF EXISTS `{name}`")
+
+
 def _pg_scalar(pg_conn, sql: str):
     with pg_conn.cursor() as cur:
         cur.execute(sql)

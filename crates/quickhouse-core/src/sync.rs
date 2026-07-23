@@ -243,6 +243,11 @@ async fn run_transfer_impl(
     };
     let archive_info = build_archive_run_info(s3_archive_cfg, &cfg.dest_table)?;
 
+    // Per-run-unique staging table name (see `staging_name`), computed once
+    // and reused at every create/swap/merge/drop site this run.
+    let run_id = new_run_id();
+    let staging = staging_name(&cfg.dest_table, &run_id);
+
     // BigQuery has a genuinely different execution model (no discrete
     // range-partitions to fan out; a single read session that streams via
     // BigQuery-managed parallel streams, drained sequentially on our side —
@@ -252,7 +257,7 @@ async fn run_transfer_impl(
     if let SourceConfig::BigQuery(bq) = &source_cfg {
         let source = BigQuerySource::new(bq.project_id.clone(), bq.credentials_file.clone());
         let sink = Sink::new(dest).await?;
-        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info).await;
+        return run_transfer_bigquery(&source, sink, cfg, progress, started, archive_info, staging).await;
     }
 
     let source = Arc::new(match &source_cfg {
@@ -327,123 +332,134 @@ async fn run_transfer_impl(
     };
 
     // --- Ensure destination / staging tables exist. ---
-    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns).await?;
+    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    // Whether this run actually created a staging table (vs. inserting straight
+    // into the destination, as ClickHouse incremental does) — decides whether
+    // the error path below has anything to clean up.
+    let used_staging = target_table != cfg.dest_table;
+    let cleanup_sink = sink.clone();
+    let cleanup_staging_name = staging.clone();
 
-    tracing::info!(
-        "quickhouse: transferring into {} across {} partition(s), parallelism={}",
-        target_table,
-        partitions.len(),
-        cfg.parallelism
-    );
+    // The whole fallible tail runs inside this block so that, on ANY error, we
+    // best-effort drop the per-run staging table below — a unique-per-run name
+    // is never reclaimed by a later run (unlike the old fixed name), so a
+    // failed run would otherwise leak it forever.
+    let outcome: Result<TransferResult> = async move {
+        tracing::info!(
+            "quickhouse: transferring into {} across {} partition(s), parallelism={}",
+            target_table,
+            partitions.len(),
+            cfg.parallelism
+        );
 
-    // --- Fan out partitions with bounded concurrency. ---
-    let counters = Arc::new(Counters::default());
-    let cfg = Arc::new(cfg);
-    let extra_filter = Arc::new(extra_filter);
-    let target_table = Arc::new(target_table);
-    let ctx = SendCtx {
-        sink: sink.clone(),
-        budget: MemoryBudget::new(cfg.max_memory_bytes),
-        target_table: target_table.clone(),
-        counters: counters.clone(),
-        progress: progress.clone(),
-        started,
-        archive: archive_info.clone(),
-    };
+        // --- Fan out partitions with bounded concurrency. ---
+        let counters = Arc::new(Counters::default());
+        let cfg = Arc::new(cfg);
+        let extra_filter = Arc::new(extra_filter);
+        let target_table = Arc::new(target_table);
+        let ctx = SendCtx {
+            sink: sink.clone(),
+            budget: MemoryBudget::new(cfg.max_memory_bytes),
+            target_table: target_table.clone(),
+            counters: counters.clone(),
+            progress: progress.clone(),
+            started,
+            archive: archive_info.clone(),
+        };
 
-    let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
-        let source = source.clone();
-        let plan = plan.clone();
-        let cfg = cfg.clone();
-        let ctx = ctx.clone();
-        let extra_filter = extra_filter.clone();
-        let base_table = base_table.clone();
-        let base_query = base_query.clone();
-        async move {
-            match source.as_ref() {
-                Source::Postgres(s) => {
-                    transfer_partition_postgres(
-                        s,
-                        &plan,
-                        &cfg,
-                        &ctx,
-                        base_table.as_deref(),
-                        base_query.as_deref(),
-                        extra_filter.as_deref(),
-                        part,
-                    )
-                    .await
+        let mut results = futures::stream::iter(partitions.into_iter().map(|part| {
+            let source = source.clone();
+            let plan = plan.clone();
+            let cfg = cfg.clone();
+            let ctx = ctx.clone();
+            let extra_filter = extra_filter.clone();
+            let base_table = base_table.clone();
+            let base_query = base_query.clone();
+            async move {
+                match source.as_ref() {
+                    Source::Postgres(s) => {
+                        transfer_partition_postgres(
+                            s,
+                            &plan,
+                            &cfg,
+                            &ctx,
+                            base_table.as_deref(),
+                            base_query.as_deref(),
+                            extra_filter.as_deref(),
+                            part,
+                        )
+                        .await
+                    }
+                    Source::MySql(s) => {
+                        transfer_partition_mysql(
+                            s,
+                            &plan,
+                            &cfg,
+                            &ctx,
+                            base_table.as_deref(),
+                            base_query.as_deref(),
+                            extra_filter.as_deref(),
+                            part,
+                        )
+                        .await
+                    }
+                    Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
                 }
-                Source::MySql(s) => {
-                    transfer_partition_mysql(
-                        s,
-                        &plan,
-                        &cfg,
-                        &ctx,
-                        base_table.as_deref(),
-                        base_query.as_deref(),
-                        extra_filter.as_deref(),
-                        part,
-                    )
-                    .await
-                }
-                Source::BigQuery(_) => unreachable!("BigQuery is handled via the early return in run_transfer"),
+            }
+        }))
+        .buffer_unordered(cfg.parallelism);
+
+        while let Some(r) = results.next().await {
+            r?; // propagate the first partition error
+        }
+        tracing::info!(
+            "all partitions read: {} rows written",
+            counters.rows_written.load(Ordering::Relaxed)
+        );
+
+        // --- Full refresh: atomically swap staging into place. ---
+        if cfg.mode == SyncMode::Full {
+            tracing::info!("swapping staging table into '{}'", cfg.dest_table);
+            sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
+            sink.drop_table(&staging).await?;
+        }
+
+        // --- Incremental: merge staged rows into the destination (destinations
+        // with no engine-level dedup), then persist the new watermark. ---
+        if cfg.mode == SyncMode::Incremental {
+            if sink.requires_staging_for_incremental() {
+                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns).await?;
+                sink.drop_table(&staging).await?;
+            }
+            if let Some(w) = &new_watermark {
+                tracing::info!("persisting new watermark: {w}");
+                sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                    .await?;
             }
         }
-    }))
-    .buffer_unordered(cfg.parallelism);
 
-    while let Some(r) = results.next().await {
-        r?; // propagate the first partition error
+        let duration_secs = started.elapsed().as_secs_f64();
+        tracing::info!(
+            "transfer complete: {} rows in {:.2}s ({:.0} rows/s)",
+            counters.rows_written.load(Ordering::Relaxed),
+            duration_secs,
+            counters.rows_written.load(Ordering::Relaxed) as f64 / duration_secs.max(0.001)
+        );
+        Ok(TransferResult {
+            rows_read: counters.rows_read.load(Ordering::Relaxed),
+            rows_written: counters.rows_written.load(Ordering::Relaxed),
+            bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            duration_secs,
+            new_watermark,
+        })
     }
-    tracing::info!(
-        "all partitions read: {} rows written",
-        counters.rows_written.load(Ordering::Relaxed)
-    );
+    .await;
 
-    // --- Full refresh: atomically swap staging into place. ---
-    if cfg.mode == SyncMode::Full {
-        tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table), &plan.dest_columns)
-            .await?;
-        sink.drop_table(&staging_name(&cfg.dest_table)).await?;
+    if outcome.is_err() && used_staging {
+        cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
     }
-
-    // --- Incremental: merge staged rows into the destination (destinations
-    // with no engine-level dedup), then persist the new watermark. ---
-    if cfg.mode == SyncMode::Incremental {
-        if sink.requires_staging_for_incremental() {
-            tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-            sink.merge_into(
-                &cfg.dest_table,
-                &staging_name(&cfg.dest_table),
-                &cfg.key,
-                &plan.dest_columns,
-            )
-            .await?;
-            sink.drop_table(&staging_name(&cfg.dest_table)).await?;
-        }
-        if let Some(w) = &new_watermark {
-            tracing::info!("persisting new watermark: {w}");
-            sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
-                .await?;
-        }
-    }
-
-    let duration_secs = started.elapsed().as_secs_f64();
-    tracing::info!(
-        "transfer complete: {} rows in {:.2}s ({:.0} rows/s)",
-        counters.rows_written.load(Ordering::Relaxed),
-        duration_secs,
-        counters.rows_written.load(Ordering::Relaxed) as f64 / duration_secs.max(0.001)
-    );
-    Ok(TransferResult {
-        rows_read: counters.rows_read.load(Ordering::Relaxed),
-        rows_written: counters.rows_written.load(Ordering::Relaxed),
-        bytes_written: counters.bytes_written.load(Ordering::Relaxed),
-        duration_secs,
-        new_watermark,
-    })
+    outcome
 }
 
 /// BigQuery's whole transfer flow: no discrete range-partitions (see the
@@ -457,6 +473,7 @@ async fn run_transfer_bigquery(
     progress: Option<ProgressCb>,
     started: Instant,
     archive_info: Option<Arc<ArchiveRunInfo>>,
+    staging: String,
 ) -> Result<TransferResult> {
     let (client, project_id) = source.connect().await?;
     tracing::info!("authenticated with bigquery, project_id={project_id}");
@@ -509,117 +526,123 @@ async fn run_transfer_bigquery(
         (None, None)
     };
 
-    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns).await?;
+    let target_table = prepare_target(&sink, &cfg, &plan.dest_columns, &staging).await?;
+    let used_staging = target_table != cfg.dest_table;
+    let cleanup_sink = sink.clone();
+    let cleanup_staging_name = staging.clone();
 
-    tracing::info!(
-        "quickhouse: transferring into {} via BigQuery Storage Read API, max_stream_count={}",
-        target_table,
-        cfg.parallelism
-    );
+    // Fallible tail wrapped so any error triggers best-effort staging cleanup
+    // below (a unique-per-run staging name is never reclaimed by a later run).
+    let outcome: Result<TransferResult> = async move {
+        tracing::info!(
+            "quickhouse: transferring into {} via BigQuery Storage Read API, max_stream_count={}",
+            target_table,
+            cfg.parallelism
+        );
 
-    let counters = Arc::new(Counters::default());
-    let ctx = SendCtx {
-        sink: sink.clone(),
-        budget: MemoryBudget::new(cfg.max_memory_bytes),
-        target_table: Arc::new(target_table),
-        counters: counters.clone(),
-        progress: progress.clone(),
-        started,
-        archive: archive_info,
-    };
+        let counters = Arc::new(Counters::default());
+        let ctx = SendCtx {
+            sink: sink.clone(),
+            budget: MemoryBudget::new(cfg.max_memory_bytes),
+            target_table: Arc::new(target_table),
+            counters: counters.clone(),
+            progress: progress.clone(),
+            started,
+            archive: archive_info,
+        };
 
-    let mut iter = source
-        .read_table::<google_cloud_bigquery::storage::row::Row>(
-            &client,
-            &table_ref,
-            &plan.source_columns,
-            row_restriction.as_deref(),
-            cfg.parallelism as i32,
-        )
-        .await?;
+        let mut iter = source
+            .read_table::<google_cloud_bigquery::storage::row::Row>(
+                &client,
+                &table_ref,
+                &plan.source_columns,
+                row_restriction.as_deref(),
+                cfg.parallelism as i32,
+            )
+            .await?;
 
-    let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
-    let schema = batcher.schema();
-    let mut sends: JoinSet<Result<()>> = JoinSet::new();
-    // No discrete partitions on this path (see the module docs) — "all" is
-    // the only file this run will ever archive for this table.
-    let mut archive_writer = match &ctx.archive {
-        Some(info) => Some(info.writer_for("all", schema.clone())?),
-        None => None,
-    };
-    while let Some(row) = iter
-        .next()
-        .await
-        .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
-    {
-        if let Some(batch) = batcher.append_row(&row)? {
+        let mut batcher = BigQueryBatcher::with_batch_bytes(&plan.dest_columns, cfg.batch_rows, cfg.batch_bytes)?;
+        let schema = batcher.schema();
+        let mut sends: JoinSet<Result<()>> = JoinSet::new();
+        // No discrete partitions on this path (see the module docs) — "all" is
+        // the only file this run will ever archive for this table.
+        let mut archive_writer = match &ctx.archive {
+            Some(info) => Some(info.writer_for("all", schema.clone())?),
+            None => None,
+        };
+        while let Some(row) = iter
+            .next()
+            .await
+            .map_err(|e| EtlError::other(format!("bigquery row error: {e}")))?
+        {
+            if let Some(batch) = batcher.append_row(&row)? {
+                if let Some(w) = archive_writer.as_mut() {
+                    w.write(&batch).await?;
+                }
+                ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
+                reap(&mut sends, false).await?;
+            }
+        }
+        if let Some(batch) = batcher.finish()? {
             if let Some(w) = archive_writer.as_mut() {
                 w.write(&batch).await?;
             }
             ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
-            reap(&mut sends, false).await?;
         }
-    }
-    if let Some(batch) = batcher.finish()? {
-        if let Some(w) = archive_writer.as_mut() {
-            w.write(&batch).await?;
+        if let Some(w) = archive_writer.take() {
+            w.close().await?;
         }
-        ctx.spawn_upload(&mut sends, schema.clone(), batch).await;
-    }
-    if let Some(w) = archive_writer.take() {
-        w.close().await?;
-    }
-    reap(&mut sends, true).await?;
-    counters
-        .rows_read
-        .fetch_add(batcher.rows_total, Ordering::Relaxed);
-    emit_progress(&counters, &progress, started);
-    warn_coerced_dates("bigquery read", batcher.invalid_dates_total);
-    warn_coerced_decimals("bigquery read", batcher.invalid_decimals_total);
-    tracing::info!(
-        "bigquery read complete: {} rows written",
-        counters.rows_written.load(Ordering::Relaxed)
-    );
+        reap(&mut sends, true).await?;
+        counters
+            .rows_read
+            .fetch_add(batcher.rows_total, Ordering::Relaxed);
+        emit_progress(&counters, &progress, started);
+        warn_coerced_dates("bigquery read", batcher.invalid_dates_total);
+        warn_coerced_decimals("bigquery read", batcher.invalid_decimals_total);
+        tracing::info!(
+            "bigquery read complete: {} rows written",
+            counters.rows_written.load(Ordering::Relaxed)
+        );
 
-    if cfg.mode == SyncMode::Full {
-        tracing::info!("swapping staging table into '{}'", cfg.dest_table);
-        sink.atomic_swap(&cfg.dest_table, &staging_name(&cfg.dest_table), &plan.dest_columns)
-            .await?;
-        sink.drop_table(&staging_name(&cfg.dest_table)).await?;
-    }
-    if cfg.mode == SyncMode::Incremental {
-        if sink.requires_staging_for_incremental() {
-            tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
-            sink.merge_into(
-                &cfg.dest_table,
-                &staging_name(&cfg.dest_table),
-                &cfg.key,
-                &plan.dest_columns,
-            )
-            .await?;
-            sink.drop_table(&staging_name(&cfg.dest_table)).await?;
+        if cfg.mode == SyncMode::Full {
+            tracing::info!("swapping staging table into '{}'", cfg.dest_table);
+            sink.atomic_swap(&cfg.dest_table, &staging, &plan.dest_columns).await?;
+            sink.drop_table(&staging).await?;
         }
-        if let Some(w) = &new_watermark {
-            tracing::info!("persisting new watermark: {w}");
-            sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
-                .await?;
+        if cfg.mode == SyncMode::Incremental {
+            if sink.requires_staging_for_incremental() {
+                tracing::info!("merging staged incremental rows into '{}'", cfg.dest_table);
+                sink.merge_into(&cfg.dest_table, &staging, &cfg.key, &plan.dest_columns).await?;
+                sink.drop_table(&staging).await?;
+            }
+            if let Some(w) = &new_watermark {
+                tracing::info!("persisting new watermark: {w}");
+                sink.persist_watermark(&cfg, w, counters.rows_written.load(Ordering::Relaxed))
+                    .await?;
+            }
         }
-    }
 
-    let duration_secs = started.elapsed().as_secs_f64();
-    tracing::info!(
-        "transfer complete: {} rows in {:.2}s ({:.0} rows/s)",
-        counters.rows_written.load(Ordering::Relaxed),
-        duration_secs,
-        counters.rows_written.load(Ordering::Relaxed) as f64 / duration_secs.max(0.001)
-    );
-    Ok(TransferResult {
-        rows_read: counters.rows_read.load(Ordering::Relaxed),
-        rows_written: counters.rows_written.load(Ordering::Relaxed),
-        bytes_written: counters.bytes_written.load(Ordering::Relaxed),
-        duration_secs,
-        new_watermark,
-    })
+        let duration_secs = started.elapsed().as_secs_f64();
+        tracing::info!(
+            "transfer complete: {} rows in {:.2}s ({:.0} rows/s)",
+            counters.rows_written.load(Ordering::Relaxed),
+            duration_secs,
+            counters.rows_written.load(Ordering::Relaxed) as f64 / duration_secs.max(0.001)
+        );
+        Ok(TransferResult {
+            rows_read: counters.rows_read.load(Ordering::Relaxed),
+            rows_written: counters.rows_written.load(Ordering::Relaxed),
+            bytes_written: counters.bytes_written.load(Ordering::Relaxed),
+            duration_secs,
+            new_watermark,
+        })
+    }
+    .await;
+
+    if outcome.is_err() && used_staging {
+        cleanup_staging(&cleanup_sink, &cleanup_staging_name).await;
+    }
+    outcome
 }
 
 async fn setup_postgres(
@@ -960,6 +983,7 @@ async fn prepare_target(
     sink: &Sink,
     cfg: &TransferConfig,
     dest_columns: &[ColumnType],
+    staging: &str,
 ) -> Result<String> {
     match cfg.mode {
         SyncMode::Full => {
@@ -977,12 +1001,14 @@ async fn prepare_target(
             } else {
                 tracing::debug!("destination table '{}' already exists", cfg.dest_table);
             }
-            // Fresh staging table (dropped first in case a prior run crashed).
-            let staging = staging_name(&cfg.dest_table);
+            // Fresh, per-run-unique staging table. The unique name (see
+            // `staging_name`) is why we can create it without first dropping a
+            // prior one: a name that's never been used can't collide with a
+            // crashed run's orphan, and — for BigQuery — never enters the
+            // "recently deleted/recreated" state that blocks streaming inserts.
             tracing::info!("creating staging table '{staging}'");
-            sink.drop_table(&staging).await?;
-            sink.create_table(&staging, dest_columns, cfg).await?;
-            Ok(staging)
+            sink.create_table(staging, dest_columns, cfg).await?;
+            Ok(staging.to_string())
         }
         SyncMode::Incremental => {
             // Checked first, before any network I/O: MERGE has nothing to
@@ -1015,11 +1041,9 @@ async fn prepare_target(
             sink.ensure_state_table().await?;
 
             if sink.requires_staging_for_incremental() {
-                let staging = staging_name(&cfg.dest_table);
                 tracing::info!("creating staging table '{staging}' for incremental merge");
-                sink.drop_table(&staging).await?;
-                sink.create_table(&staging, dest_columns, cfg).await?;
-                Ok(staging)
+                sink.create_table(staging, dest_columns, cfg).await?;
+                Ok(staging.to_string())
             } else {
                 Ok(cfg.dest_table.clone())
             }
@@ -1116,8 +1140,38 @@ async fn compute_partitions_mysql(
         .await
 }
 
-fn staging_name(dest: &str) -> String {
-    format!("{dest}{STAGING_SUFFIX}")
+/// Per-run-unique staging table name: `{dest}_quickhouse_tmp_{run_id}`.
+///
+/// The `run_id` makes the name **never reused across runs** — this is a
+/// correctness requirement, not cosmetic. BigQuery blocks streaming inserts
+/// into a table that was dropped and recreated under the same name within a
+/// (minutes-long, eventually-consistent) metadata window; a fixed staging
+/// name made every rapid re-run / whole-call retry recreate-then-stream and
+/// hit that block. A never-before-used name can't be in the "recently
+/// recreated" state, so the window never applies. It also means a crashed
+/// run's orphaned staging table can't poison the next run (which uses a
+/// different name) — at the cost that orphans are no longer auto-reclaimed by
+/// the next run, so callers drop staging on the error path too.
+fn staging_name(dest: &str, run_id: &str) -> String {
+    format!("{dest}{STAGING_SUFFIX}_{run_id}")
+}
+
+/// A run id unique enough that a staging table name built from it is never
+/// reused across runs (including seconds-apart retries) — nanosecond wall
+/// clock, matching `sink::bigquery`'s `unique_job_id` idiom.
+fn new_run_id() -> String {
+    time::OffsetDateTime::now_utc().unix_timestamp_nanos().to_string()
+}
+
+/// Best-effort drop of a per-run staging table after a failed transfer. A
+/// unique-per-run name isn't reclaimed by any later run, so without this a
+/// failed run would leak its staging table (a full data copy, for
+/// full-refresh). Deliberately swallows its own error (logs a warning) so it
+/// never masks the real transfer error being propagated.
+async fn cleanup_staging(sink: &Sink, staging: &str) {
+    if let Err(e) = sink.drop_table(staging).await {
+        tracing::warn!("failed to drop staging table '{staging}' after a failed transfer: {e}");
+    }
 }
 
 fn build_watermark_filter_pg(
@@ -1300,6 +1354,25 @@ fn build_watermark_filter(col: &str, lower_bound: Option<String>, upper_bound: O
 mod tests {
     use super::*;
     use arrow_schema::DataType;
+
+    #[test]
+    fn staging_name_includes_dest_suffix_and_run_id() {
+        let name = staging_name("orders", "12345");
+        assert_eq!(name, "orders_quickhouse_tmp_12345");
+        assert!(name.starts_with("orders"));
+        assert!(name.contains(STAGING_SUFFIX));
+    }
+
+    #[test]
+    fn staging_name_is_distinct_per_run_id() {
+        // The core property that defeats bug 10: the same destination table
+        // never yields the same staging name across runs, so BigQuery can't
+        // see a drop+recreate of a recently-used name. (run_id itself comes
+        // from a nanosecond wall clock — not asserted here to avoid a
+        // clock-resolution-dependent flaky test; the naming logic is what
+        // matters and is deterministic given distinct run_ids.)
+        assert_ne!(staging_name("orders", "1"), staging_name("orders", "2"));
+    }
 
     fn col(name: &str) -> ColumnType {
         col_typed(name, DataType::Int64)

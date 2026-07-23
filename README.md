@@ -148,6 +148,12 @@ deduplicated on `key` — via ClickHouse's `ReplacingMergeTree`, or a `MERGE`
 upsert on BigQuery (where `key` is therefore required). Re-running with no new
 data does nothing.
 
+Both modes stage through a per-run-unique table (`{dest}_quickhouse_tmp_<id>`)
+that's dropped when the run finishes, including on failure. The unique name is
+what makes rapid re-runs and whole-call retries safe on BigQuery, whose
+streaming ingestion rejects writes into a table recently recreated under the
+same name.
+
 For daily syncs that need to catch late-arriving or edited rows, set
 `lookback_seconds` to re-scan a trailing window (e.g. `3 * 86400` for the last
 three days) — the dedup above keeps that overlap from creating duplicates.
